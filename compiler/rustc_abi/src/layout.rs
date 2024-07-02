@@ -2,7 +2,6 @@ use std::borrow::{Borrow, Cow};
 use std::cmp;
 use std::fmt::{self, Write};
 use std::iter;
-use std::num::NonZero;
 use std::ops::Bound;
 use std::ops::Deref;
 
@@ -11,8 +10,8 @@ use tracing::debug;
 
 use crate::{
     Abi, AbiAndPrefAlign, Align, FieldsShape, IndexSlice, IndexVec, Integer, LayoutS, Niche,
-    Primitive, ReprOptions, Scalar, Size, StructKind, TagEncoding, TargetDataLayout, Variants,
-    WrappingRange,
+    NonZeroUsize, Primitive, ReprOptions, Scalar, Size, StructKind, TagEncoding, TargetDataLayout,
+    Variants, WrappingRange,
 };
 
 // A variant is absent if it's uninhabited and only has ZST fields.
@@ -328,7 +327,7 @@ pub trait LayoutCalculator {
 
         Some(LayoutS {
             variants: Variants::Single { index: VariantIdx::new(0) },
-            fields: FieldsShape::Union(NonZero::new(only_variant.len())?),
+            fields: FieldsShape::Union(NonZeroUsize::new(only_variant.len())?),
             abi,
             largest_niche: None,
             align,
@@ -971,7 +970,7 @@ fn univariant<
     let mut align = if pack.is_some() { dl.i8_align } else { dl.aggregate_align };
     let mut max_repr_align = repr.align;
     let mut inverse_memory_index: IndexVec<u32, FieldIdx> = fields.indices().collect();
-    let optimize = !repr.inhibit_struct_field_reordering_opt();
+    let optimize = !repr.inhibit_struct_field_reordering();
     if optimize && fields.len() > 1 {
         let end = if let StructKind::MaybeUnsized = kind { fields.len() - 1 } else { fields.len() };
         let optimizing = &mut inverse_memory_index.raw[..end];
@@ -1008,13 +1007,15 @@ fn univariant<
             // Calculates a sort key to group fields by their alignment or possibly some
             // size-derived pseudo-alignment.
             let alignment_group_key = |layout: &F| {
+                // The two branches here return values that cannot be meaningfully compared with
+                // each other. However, we know that consistently for all executions of
+                // `alignment_group_key`, one or the other branch will be taken, so this is okay.
                 if let Some(pack) = pack {
                     // Return the packed alignment in bytes.
                     layout.align.abi.min(pack).bytes()
                 } else {
-                    // Returns `log2(effective-align)`. This is ok since `pack` applies to all
-                    // fields equally. The calculation assumes that size is an integer multiple of
-                    // align, except for ZSTs.
+                    // Returns `log2(effective-align)`. The calculation assumes that size is an
+                    // integer multiple of align, except for ZSTs.
                     let align = layout.align.abi.bytes();
                     let size = layout.size.bytes();
                     let niche_size = layout.largest_niche.map(|n| n.available(dl)).unwrap_or(0);

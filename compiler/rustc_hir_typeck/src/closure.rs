@@ -89,7 +89,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         [Ty::new_tup(tcx, sig.inputs())],
                         sig.output(),
                         sig.c_variadic,
-                        sig.unsafety,
+                        sig.safety,
                         sig.abi,
                     )
                 });
@@ -238,7 +238,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                     ],
                                     Ty::new_tup(tcx, &[bound_yield_ty, bound_return_ty]),
                                     sig.c_variadic,
-                                    sig.unsafety,
+                                    sig.safety,
                                     sig.abi,
                                 )
                             }),
@@ -281,7 +281,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     liberated_sig.inputs().iter().copied(),
                     coroutine_output_ty,
                     liberated_sig.c_variadic,
-                    liberated_sig.unsafety,
+                    liberated_sig.safety,
                     liberated_sig.abi,
                 );
 
@@ -485,7 +485,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         };
 
         // Since this is a return parameter type it is safe to unwrap.
-        let ret_param_ty = projection.skip_binder().term.ty().unwrap();
+        let ret_param_ty = projection.skip_binder().term.expect_type();
         let ret_param_ty = self.resolve_vars_if_possible(ret_param_ty);
         debug!(?ret_param_ty);
 
@@ -493,7 +493,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             input_tys,
             ret_param_ty,
             false,
-            hir::Unsafety::Normal,
+            hir::Safety::Safe,
             Abi::Rust,
         ));
 
@@ -605,7 +605,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 sig.inputs().iter().cloned(),
                 sig.output(),
                 sig.c_variadic,
-                hir::Unsafety::Normal,
+                hir::Safety::Safe,
                 Abi::RustCall,
             )
         });
@@ -743,7 +743,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 inputs,
                 supplied_output_ty,
                 expected_sigs.liberated_sig.c_variadic,
-                hir::Unsafety::Normal,
+                hir::Safety::Safe,
                 Abi::RustCall,
             );
 
@@ -820,7 +820,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 supplied_arguments,
                 supplied_return,
                 decl.c_variadic,
-                hir::Unsafety::Normal,
+                hir::Safety::Safe,
                 Abi::RustCall,
             ),
             bound_vars,
@@ -956,7 +956,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let output_ty = self.resolve_vars_if_possible(predicate.term);
         debug!("deduce_future_output_from_projection: output_ty={:?}", output_ty);
         // This is a projection on a Fn trait so will always be a type.
-        Some(output_ty.ty().unwrap())
+        Some(output_ty.expect_type())
     }
 
     /// Converts the types that the user supplied, in case that doing
@@ -984,7 +984,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             supplied_arguments,
             err_ty,
             decl.c_variadic,
-            hir::Unsafety::Normal,
+            hir::Safety::Safe,
             Abi::RustCall,
         ));
 

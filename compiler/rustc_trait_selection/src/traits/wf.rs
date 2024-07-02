@@ -286,7 +286,7 @@ fn extend_cause_with_original_assoc_item_obligation<'tcx>(
             // implemented, but rather from a "second order" obligation, where an associated
             // type has a projection coming from another associated type.
             // See `tests/ui/traits/assoc-type-in-superbad.rs` for an example.
-            if let Some(term_ty) = proj.term.ty()
+            if let Some(term_ty) = proj.term.as_type()
                 && let Some(impl_item_span) = ty_to_impl_span(term_ty)
             {
                 cause.span = impl_item_span;
@@ -377,7 +377,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
         let item = self.item;
 
         let extend = |traits::PredicateObligation { predicate, mut cause, .. }| {
-            if let Some(parent_trait_pred) = predicate.to_opt_poly_trait_pred() {
+            if let Some(parent_trait_pred) = predicate.as_trait_clause() {
                 cause = cause.derived_cause(
                     parent_trait_pred,
                     traits::ObligationCauseCode::WellFormedDerived,

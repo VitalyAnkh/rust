@@ -256,12 +256,12 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
                 (false, None, None, Some(span), String::new())
             };
 
-        let expected_trait_ref = self.cx.resolve_vars_if_possible(ty::TraitRef::new(
+        let expected_trait_ref = self.cx.resolve_vars_if_possible(ty::TraitRef::new_from_args(
             self.cx.tcx,
             trait_def_id,
             expected_args,
         ));
-        let actual_trait_ref = self.cx.resolve_vars_if_possible(ty::TraitRef::new(
+        let actual_trait_ref = self.cx.resolve_vars_if_possible(ty::TraitRef::new_from_args(
             self.cx.tcx,
             trait_def_id,
             actual_args,
@@ -409,10 +409,8 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
             {
                 let closure_sig = self_ty.map(|closure| {
                     if let ty::Closure(_, args) = closure.kind() {
-                        self.tcx().signature_unclosure(
-                            args.as_closure().sig(),
-                            rustc_hir::Unsafety::Normal,
-                        )
+                        self.tcx()
+                            .signature_unclosure(args.as_closure().sig(), rustc_hir::Safety::Safe)
                     } else {
                         bug!("type is not longer closure");
                     }
