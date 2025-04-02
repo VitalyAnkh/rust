@@ -175,6 +175,10 @@ pub fn par_for_each_in<I: DynSend, T: IntoIterator<Item = I>>(
     });
 }
 
+/// This runs `for_each` in parallel for each iterator item. If one or more of the
+/// `for_each` calls returns `Err`, the function will also return `Err`. The error returned
+/// will be non-deterministic, but this is expected to be used with `ErrorGuaranteed` which
+/// are all equivalent.
 pub fn try_par_for_each_in<T: IntoIterator, E: DynSend>(
     t: T,
     for_each: impl Fn(&<T as IntoIterator>::Item) -> Result<(), E> + DynSync + DynSend,

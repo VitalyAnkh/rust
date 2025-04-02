@@ -732,21 +732,14 @@ pub(crate) fn run_aot(
         tcx.sess.time("codegen mono items", || {
             let modules: Vec<_> = par_map(todo_cgus, |(_, cgu)| {
                 let dep_node = cgu.codegen_dep_node(tcx);
-                IntoDynSyncSend(
-                    tcx.dep_graph
-                        .with_task(
-                            dep_node,
-                            tcx,
-                            (
-                                global_asm_config.clone(),
-                                cgu.name(),
-                                concurrency_limiter.acquire(tcx.dcx()),
-                            ),
-                            module_codegen,
-                            Some(rustc_middle::dep_graph::hash_result),
-                        )
-                        .0,
-                )
+                let (module, _) = tcx.dep_graph.with_task(
+                    dep_node,
+                    tcx,
+                    (global_asm_config.clone(), cgu.name(), concurrency_limiter.acquire(tcx.dcx())),
+                    module_codegen,
+                    Some(rustc_middle::dep_graph::hash_result),
+                );
+                IntoDynSyncSend(module)
             });
             modules
                 .into_iter()
