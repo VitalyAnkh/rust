@@ -45,8 +45,8 @@ mod core;
 mod utils;
 
 pub use core::builder::PathSet;
-pub use core::config::Config;
 pub use core::config::flags::{Flags, Subcommand};
+pub use core::config::{ChangeId, Config};
 
 #[cfg(feature = "tracing")]
 use tracing::{instrument, span};
@@ -748,7 +748,7 @@ impl Build {
             features.push("llvm");
         }
         // keep in sync with `bootstrap/compile.rs:rustc_cargo_env`
-        if self.config.rust_randomize_layout {
+        if self.config.rust_randomize_layout && check("rustc_randomized_layouts") {
             features.push("rustc_randomized_layouts");
         }
 

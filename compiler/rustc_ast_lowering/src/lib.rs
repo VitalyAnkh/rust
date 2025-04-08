@@ -55,7 +55,8 @@ use rustc_errors::{DiagArgFromDisplay, DiagCtxtHandle, StashKey};
 use rustc_hir::def::{DefKind, LifetimeRes, Namespace, PartialRes, PerNS, Res};
 use rustc_hir::def_id::{CRATE_DEF_ID, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{
-    self as hir, ConstArg, GenericArg, HirId, ItemLocalMap, LangItem, ParamName, TraitCandidate,
+    self as hir, ConstArg, GenericArg, HirId, IsAnonInPath, ItemLocalMap, LangItem, ParamName,
+    TraitCandidate,
 };
 use rustc_index::{Idx, IndexSlice, IndexVec};
 use rustc_macros::extension;
@@ -121,7 +122,6 @@ struct LoweringContext<'a, 'hir> {
     catch_scope: Option<HirId>,
     loop_scope: Option<HirId>,
     is_in_loop_condition: bool,
-    is_in_trait_impl: bool,
     is_in_dyn_type: bool,
 
     current_hir_id_owner: hir::OwnerId,
@@ -173,7 +173,6 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             catch_scope: None,
             loop_scope: None,
             is_in_loop_condition: false,
-            is_in_trait_impl: false,
             is_in_dyn_type: false,
             coroutine_kind: None,
             task_context: None,
@@ -625,7 +624,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
 
         // Don't hash unless necessary, because it's expensive.
         let (opt_hash_including_bodies, attrs_hash) =
-            self.tcx.hash_owner_nodes(node, &bodies, &attrs);
+            self.tcx.hash_owner_nodes(node, &bodies, &attrs, define_opaque);
         let num_nodes = self.item_local_id_counter.as_usize();
         let (nodes, parenting) = index::index_hir(self.tcx, node, &bodies, num_nodes);
         let nodes = hir::OwnerNodes { opt_hash_including_bodies, nodes, bodies };
@@ -1442,28 +1441,6 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         // frequently opened issues show.
         let opaque_ty_span = self.mark_span_with_reason(DesugaringKind::OpaqueTy, span, None);
 
-        // Feature gate for RPITIT + use<..>
-        match origin {
-            rustc_hir::OpaqueTyOrigin::FnReturn { in_trait_or_impl: Some(_), .. } => {
-                if !self.tcx.features().precise_capturing_in_traits()
-                    && let Some(span) = bounds.iter().find_map(|bound| match *bound {
-                        ast::GenericBound::Use(_, span) => Some(span),
-                        _ => None,
-                    })
-                {
-                    let mut diag =
-                        self.tcx.dcx().create_err(errors::NoPreciseCapturesOnRpitit { span });
-                    add_feature_diagnostics(
-                        &mut diag,
-                        self.tcx.sess,
-                        sym::precise_capturing_in_traits,
-                    );
-                    diag.emit();
-                }
-            }
-            _ => {}
-        }
-
         self.lower_opaque_inner(opaque_ty_node_id, origin, opaque_ty_span, |this| {
             this.lower_param_bounds(bounds, itctx)
         })
@@ -1519,18 +1496,13 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
 
     fn lower_fn_params_to_names(&mut self, decl: &FnDecl) -> &'hir [Option<Ident>] {
         self.arena.alloc_from_iter(decl.inputs.iter().map(|param| match param.pat.kind {
-            PatKind::Ident(_, ident, _) => {
-                if ident.name != kw::Empty {
-                    Some(self.lower_ident(ident))
-                } else {
-                    None
-                }
-            }
+            PatKind::Missing => None,
+            PatKind::Ident(_, ident, _) => Some(self.lower_ident(ident)),
             PatKind::Wild => Some(Ident::new(kw::Underscore, self.lower_span(param.pat.span))),
             _ => {
                 self.dcx().span_delayed_bug(
                     param.pat.span,
-                    "non-ident/wild param pat must trigger an error",
+                    "non-missing/ident/wild param pat must trigger an error",
                 );
                 None
             }
@@ -1779,7 +1751,11 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
     }
 
     fn lower_lifetime(&mut self, l: &Lifetime) -> &'hir hir::Lifetime {
-        self.new_named_lifetime(l.id, l.id, l.ident)
+        self.new_named_lifetime(l.id, l.id, l.ident, IsAnonInPath::No)
+    }
+
+    fn lower_lifetime_anon_in_path(&mut self, id: NodeId, span: Span) -> &'hir hir::Lifetime {
+        self.new_named_lifetime(id, id, Ident::new(kw::UnderscoreLifetime, span), IsAnonInPath::Yes)
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1788,28 +1764,43 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         id: NodeId,
         new_id: NodeId,
         ident: Ident,
+        is_anon_in_path: IsAnonInPath,
     ) -> &'hir hir::Lifetime {
+        debug_assert_ne!(ident.name, kw::Empty);
         let res = self.resolver.get_lifetime_res(id).unwrap_or(LifetimeRes::Error);
         let res = match res {
             LifetimeRes::Param { param, .. } => hir::LifetimeName::Param(param),
             LifetimeRes::Fresh { param, .. } => {
+                debug_assert_eq!(ident.name, kw::UnderscoreLifetime);
                 let param = self.local_def_id(param);
                 hir::LifetimeName::Param(param)
             }
-            LifetimeRes::Infer => hir::LifetimeName::Infer,
-            LifetimeRes::Static { .. } => hir::LifetimeName::Static,
+            LifetimeRes::Infer => {
+                debug_assert_eq!(ident.name, kw::UnderscoreLifetime);
+                hir::LifetimeName::Infer
+            }
+            LifetimeRes::Static { .. } => {
+                debug_assert!(matches!(ident.name, kw::StaticLifetime | kw::UnderscoreLifetime));
+                hir::LifetimeName::Static
+            }
             LifetimeRes::Error => hir::LifetimeName::Error,
             LifetimeRes::ElidedAnchor { .. } => {
                 panic!("Unexpected `ElidedAnchar` {:?} at {:?}", ident, ident.span);
             }
         };
 
+        #[cfg(debug_assertions)]
+        if is_anon_in_path == IsAnonInPath::Yes {
+            debug_assert_eq!(ident.name, kw::UnderscoreLifetime);
+        }
+
         debug!(?res);
-        self.arena.alloc(hir::Lifetime {
-            hir_id: self.lower_node_id(new_id),
-            ident: self.lower_ident(ident),
+        self.arena.alloc(hir::Lifetime::new(
+            self.lower_node_id(new_id),
+            self.lower_ident(ident),
             res,
-        })
+            is_anon_in_path,
+        ))
     }
 
     fn lower_generic_params_mut(
@@ -2227,6 +2218,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             self.attrs.insert(hir_id.local_id, a);
         }
         let local = hir::LetStmt {
+            super_: None,
             hir_id,
             init,
             pat,
@@ -2393,11 +2385,12 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
     /// when the bound is written, even if it is written with `'_` like in
     /// `Box<dyn Debug + '_>`. In those cases, `lower_lifetime` is invoked.
     fn elided_dyn_bound(&mut self, span: Span) -> &'hir hir::Lifetime {
-        let r = hir::Lifetime {
-            hir_id: self.next_id(),
-            ident: Ident::new(kw::Empty, self.lower_span(span)),
-            res: hir::LifetimeName::ImplicitObjectLifetimeDefault,
-        };
+        let r = hir::Lifetime::new(
+            self.next_id(),
+            Ident::new(kw::UnderscoreLifetime, self.lower_span(span)),
+            hir::LifetimeName::ImplicitObjectLifetimeDefault,
+            IsAnonInPath::No,
+        );
         debug!("elided_dyn_bound: r={:?}", r);
         self.arena.alloc(r)
     }

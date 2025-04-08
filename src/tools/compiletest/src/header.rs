@@ -11,6 +11,7 @@ use tracing::*;
 
 use crate::common::{Config, Debugger, FailMode, Mode, PassMode};
 use crate::debuggers::{extract_cdb_version, extract_gdb_version};
+use crate::executor::{CollectedTestDesc, ShouldPanic};
 use crate::header::auxiliary::{AuxProps, parse_and_update_aux};
 use crate::header::needs::CachedNeedsConditions;
 use crate::util::static_regex;
@@ -924,7 +925,14 @@ fn iter_header(
 
 impl Config {
     fn parse_and_update_revisions(&self, testfile: &Path, line: &str, existing: &mut Vec<String>) {
-        const FORBIDDEN_REVISION_NAMES: [&str; 9] =
+        const FORBIDDEN_REVISION_NAMES: [&str; 2] = [
+            // `//@ revisions: true false` Implying `--cfg=true` and `--cfg=false` makes it very
+            // weird for the test, since if the test writer wants a cfg of the same revision name
+            // they'd have to use `cfg(r#true)` and `cfg(r#false)`.
+            "true", "false",
+        ];
+
+        const FILECHECK_FORBIDDEN_REVISION_NAMES: [&str; 9] =
             ["CHECK", "COM", "NEXT", "SAME", "EMPTY", "NOT", "COUNT", "DAG", "LABEL"];
 
         if let Some(raw) = self.parse_name_value_directive(line, "revisions") {
@@ -933,25 +941,38 @@ impl Config {
             }
 
             let mut duplicates: HashSet<_> = existing.iter().cloned().collect();
-            for revision in raw.split_whitespace().map(|r| r.to_string()) {
-                if !duplicates.insert(revision.clone()) {
+            for revision in raw.split_whitespace() {
+                if !duplicates.insert(revision.to_string()) {
                     panic!(
                         "duplicate revision: `{}` in line `{}`: {}",
                         revision,
                         raw,
                         testfile.display()
                     );
-                } else if matches!(self.mode, Mode::Assembly | Mode::Codegen | Mode::MirOpt)
-                    && FORBIDDEN_REVISION_NAMES.contains(&revision.as_str())
-                {
+                }
+
+                if FORBIDDEN_REVISION_NAMES.contains(&revision) {
                     panic!(
-                        "revision name `{revision}` is not permitted in a test suite that uses `FileCheck` annotations\n\
-                         as it is confusing when used as custom `FileCheck` prefix: `{revision}` in line `{}`: {}",
+                        "revision name `{revision}` is not permitted: `{}` in line `{}`: {}",
+                        revision,
                         raw,
                         testfile.display()
                     );
                 }
-                existing.push(revision);
+
+                if matches!(self.mode, Mode::Assembly | Mode::Codegen | Mode::MirOpt)
+                    && FILECHECK_FORBIDDEN_REVISION_NAMES.contains(&revision)
+                {
+                    panic!(
+                        "revision name `{revision}` is not permitted in a test suite that uses \
+                        `FileCheck` annotations as it is confusing when used as custom `FileCheck` \
+                        prefix: `{revision}` in line `{}`: {}",
+                        raw,
+                        testfile.display()
+                    );
+                }
+
+                existing.push(revision.to_string());
             }
         }
     }
@@ -1335,15 +1356,15 @@ where
     Some((min, max))
 }
 
-pub fn make_test_description<R: Read>(
+pub(crate) fn make_test_description<R: Read>(
     config: &Config,
     cache: &HeadersCache,
-    name: test::TestName,
+    name: String,
     path: &Path,
     src: R,
     test_revision: Option<&str>,
     poisoned: &mut bool,
-) -> test::TestDesc {
+) -> CollectedTestDesc {
     let mut ignore = false;
     let mut ignore_message = None;
     let mut should_fail = false;
@@ -1367,10 +1388,7 @@ pub fn make_test_description<R: Read>(
                     match $e {
                         IgnoreDecision::Ignore { reason } => {
                             ignore = true;
-                            // The ignore reason must be a &'static str, so we have to leak memory to
-                            // create it. This is fine, as the header is parsed only at the start of
-                            // compiletest so it won't grow indefinitely.
-                            ignore_message = Some(&*Box::leak(Box::<str>::from(reason)));
+                            ignore_message = Some(reason.into());
                         }
                         IgnoreDecision::Error { message } => {
                             eprintln!("error: {}:{line_number}: {message}", path.display());
@@ -1411,25 +1429,12 @@ pub fn make_test_description<R: Read>(
     // since we run the pretty printer across all tests by default.
     // If desired, we could add a `should-fail-pretty` annotation.
     let should_panic = match config.mode {
-        crate::common::Pretty => test::ShouldPanic::No,
-        _ if should_fail => test::ShouldPanic::Yes,
-        _ => test::ShouldPanic::No,
+        crate::common::Pretty => ShouldPanic::No,
+        _ if should_fail => ShouldPanic::Yes,
+        _ => ShouldPanic::No,
     };
 
-    test::TestDesc {
-        name,
-        ignore,
-        ignore_message,
-        source_file: "",
-        start_line: 0,
-        start_col: 0,
-        end_line: 0,
-        end_col: 0,
-        should_panic,
-        compile_fail: false,
-        no_run: false,
-        test_type: test::TestType::Unknown,
-    }
+    CollectedTestDesc { name, ignore, ignore_message, should_panic }
 }
 
 fn ignore_cdb(config: &Config, line: &str) -> IgnoreDecision {

@@ -294,7 +294,7 @@ fn link_rlib<'a>(
             let (metadata, metadata_position) = create_wrapper_file(
                 sess,
                 ".rmeta".to_string(),
-                codegen_results.metadata.raw_data(),
+                codegen_results.metadata.stub_or_full(),
             );
             let metadata = emit_wrapper_file(sess, &metadata, tmpdir, METADATA_FILENAME);
             match metadata_position {
@@ -670,7 +670,7 @@ fn link_natively(
 ) {
     info!("preparing {:?} to {:?}", crate_type, out_filename);
     let (linker_path, flavor) = linker_and_flavor(sess);
-    let self_contained_components = self_contained_components(sess, crate_type);
+    let self_contained_components = self_contained_components(sess, crate_type, &linker_path);
 
     // On AIX, we ship all libraries as .a big_af archive
     // the expected format is lib<name>.a(libname.so) for the actual
@@ -959,9 +959,9 @@ fn link_natively(
                 }
             }
 
-            let (level, src) = codegen_results.crate_info.lint_levels.linker_messages;
+            let level = codegen_results.crate_info.lint_levels.linker_messages;
             let lint = |msg| {
-                lint_level(sess, LINKER_MESSAGES, level, src, None, |diag| {
+                lint_level(sess, LINKER_MESSAGES, level, None, |diag| {
                     LinkerOutput { inner: msg }.decorate_lint(diag)
                 })
             };
@@ -1012,7 +1012,7 @@ fn link_natively(
         // On macOS the external `dsymutil` tool is used to create the packed
         // debug information. Note that this will read debug information from
         // the objects on the filesystem which we'll clean up later.
-        SplitDebuginfo::Packed if sess.target.is_like_osx => {
+        SplitDebuginfo::Packed if sess.target.is_like_darwin => {
             let prog = Command::new("dsymutil").arg(out_filename).output();
             match prog {
                 Ok(prog) => {
@@ -1043,7 +1043,7 @@ fn link_natively(
 
     let strip = sess.opts.cg.strip;
 
-    if sess.target.is_like_osx {
+    if sess.target.is_like_darwin {
         let stripcmd = "rust-objcopy";
         match (strip, crate_type) {
             (Strip::Debuginfo, _) => {
@@ -1241,7 +1241,7 @@ fn add_sanitizer_libraries(
     // Everywhere else the runtimes are currently distributed as static
     // libraries which should be linked to executables only.
     if matches!(crate_type, CrateType::Dylib | CrateType::Cdylib | CrateType::ProcMacro)
-        && !(sess.target.is_like_osx || sess.target.is_like_msvc)
+        && !(sess.target.is_like_darwin || sess.target.is_like_msvc)
     {
         return;
     }
@@ -1294,7 +1294,7 @@ fn link_sanitizer_runtime(
     let channel =
         option_env!("CFG_RELEASE_CHANNEL").map(|channel| format!("-{channel}")).unwrap_or_default();
 
-    if sess.target.is_like_osx {
+    if sess.target.is_like_darwin {
         // On Apple platforms, the sanitizer is always built as a dylib, and
         // LLVM will link to `@rpath/*.dylib`, so we need to specify an
         // rpath to the library as well (the rpath should be absolute, see
@@ -1494,7 +1494,8 @@ fn print_native_static_libs(
                 | NativeLibKind::Unspecified => {
                     let verbatim = lib.verbatim;
                     if sess.target.is_like_msvc {
-                        Some(format!("{}{}", name, if verbatim { "" } else { ".lib" }))
+                        let (prefix, suffix) = sess.staticlib_components(verbatim);
+                        Some(format!("{prefix}{name}{suffix}"))
                     } else if sess.target.linker_flavor.is_gnu() {
                         Some(format!("-l{}{}", if verbatim { ":" } else { "" }, name))
                     } else {
@@ -1559,17 +1560,13 @@ fn print_native_static_libs(
     match out {
         OutFileName::Real(path) => {
             out.overwrite(&lib_args.join(" "), sess);
-            if !lib_args.is_empty() {
-                sess.dcx().emit_note(errors::StaticLibraryNativeArtifactsToFile { path });
-            }
+            sess.dcx().emit_note(errors::StaticLibraryNativeArtifactsToFile { path });
         }
         OutFileName::Stdout => {
-            if !lib_args.is_empty() {
-                sess.dcx().emit_note(errors::StaticLibraryNativeArtifacts);
-                // Prefix for greppability
-                // Note: This must not be translated as tools are allowed to depend on this exact string.
-                sess.dcx().note(format!("native-static-libs: {}", lib_args.join(" ")));
-            }
+            sess.dcx().emit_note(errors::StaticLibraryNativeArtifacts);
+            // Prefix for greppability
+            // Note: This must not be translated as tools are allowed to depend on this exact string.
+            sess.dcx().note(format!("native-static-libs: {}", lib_args.join(" ")));
         }
     }
 }
@@ -1783,8 +1780,7 @@ fn link_output_kind(sess: &Session, crate_type: CrateType) -> LinkOutputKind {
 }
 
 // Returns true if linker is located within sysroot
-fn detect_self_contained_mingw(sess: &Session) -> bool {
-    let (linker, _) = linker_and_flavor(sess);
+fn detect_self_contained_mingw(sess: &Session, linker: &Path) -> bool {
     // Assume `-C linker=rust-lld` as self-contained mode
     if linker == Path::new("rust-lld") {
         return true;
@@ -1792,7 +1788,7 @@ fn detect_self_contained_mingw(sess: &Session) -> bool {
     let linker_with_extension = if cfg!(windows) && linker.extension().is_none() {
         linker.with_extension("exe")
     } else {
-        linker
+        linker.to_path_buf()
     };
     for dir in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
         let full_path = dir.join(&linker_with_extension);
@@ -1807,7 +1803,11 @@ fn detect_self_contained_mingw(sess: &Session) -> bool {
 /// Various toolchain components used during linking are used from rustc distribution
 /// instead of being found somewhere on the host system.
 /// We only provide such support for a very limited number of targets.
-fn self_contained_components(sess: &Session, crate_type: CrateType) -> LinkSelfContainedComponents {
+fn self_contained_components(
+    sess: &Session,
+    crate_type: CrateType,
+    linker: &Path,
+) -> LinkSelfContainedComponents {
     // Turn the backwards compatible bool values for `self_contained` into fully inferred
     // `LinkSelfContainedComponents`.
     let self_contained =
@@ -1836,7 +1836,7 @@ fn self_contained_components(sess: &Session, crate_type: CrateType) -> LinkSelfC
                 LinkSelfContainedDefault::InferredForMingw => {
                     sess.host == sess.target
                         && sess.target.vendor != "uwp"
-                        && detect_self_contained_mingw(sess)
+                        && detect_self_contained_mingw(sess, linker)
                 }
             }
         };
@@ -2182,7 +2182,7 @@ fn add_rpath_args(
         let rpath_config = RPathConfig {
             libs: &*libs,
             out_filename: out_filename.to_path_buf(),
-            is_like_osx: sess.target.is_like_osx,
+            is_like_darwin: sess.target.is_like_darwin,
             linker_is_gnu: sess.target.linker_flavor.is_gnu(),
         };
         cmd.link_args(&rpath::get_rpath_linker_args(&rpath_config));
@@ -3044,7 +3044,7 @@ pub(crate) fn are_upstream_rust_objects_already_included(sess: &Session) -> bool
 /// - The deployment target.
 /// - The SDK version.
 fn add_apple_link_args(cmd: &mut dyn Linker, sess: &Session, flavor: LinkerFlavor) {
-    if !sess.target.is_like_osx {
+    if !sess.target.is_like_darwin {
         return;
     }
     let LinkerFlavor::Darwin(cc, _) = flavor else {
@@ -3115,8 +3115,7 @@ fn add_apple_link_args(cmd: &mut dyn Linker, sess: &Session, flavor: LinkerFlavo
             _ => bug!("invalid OS/ABI combination for Apple target: {target_os}, {target_abi}"),
         };
 
-        let (major, minor, patch) = apple::deployment_target(sess);
-        let min_version = format!("{major}.{minor}.{patch}");
+        let min_version = sess.apple_deployment_target().fmt_full().to_string();
 
         // The SDK version is used at runtime when compiling with a newer SDK / version of Xcode:
         // - By dyld to give extra warnings and errors, see e.g.:
@@ -3185,10 +3184,10 @@ fn add_apple_link_args(cmd: &mut dyn Linker, sess: &Session, flavor: LinkerFlavo
 
             // The presence of `-mmacosx-version-min` makes CC default to
             // macOS, and it sets the deployment target.
-            let (major, minor, patch) = apple::deployment_target(sess);
+            let version = sess.apple_deployment_target().fmt_full();
             // Intentionally pass this as a single argument, Clang doesn't
             // seem to like it otherwise.
-            cmd.cc_arg(&format!("-mmacosx-version-min={major}.{minor}.{patch}"));
+            cmd.cc_arg(&format!("-mmacosx-version-min={version}"));
 
             // macOS has no environment, so with these two, we've told CC the
             // four desired parameters.
@@ -3201,9 +3200,7 @@ fn add_apple_link_args(cmd: &mut dyn Linker, sess: &Session, flavor: LinkerFlavo
 }
 
 fn add_apple_sdk(cmd: &mut dyn Linker, sess: &Session, flavor: LinkerFlavor) -> Option<PathBuf> {
-    let arch = &sess.target.arch;
     let os = &sess.target.os;
-    let llvm_target = &sess.target.llvm_target;
     if sess.target.vendor != "apple"
         || !matches!(os.as_ref(), "ios" | "tvos" | "watchos" | "visionos" | "macos")
         || !matches!(flavor, LinkerFlavor::Darwin(..))
@@ -3215,37 +3212,7 @@ fn add_apple_sdk(cmd: &mut dyn Linker, sess: &Session, flavor: LinkerFlavor) -> 
         return None;
     }
 
-    let sdk_name = match (arch.as_ref(), os.as_ref()) {
-        ("aarch64", "tvos") if llvm_target.ends_with("-simulator") => "appletvsimulator",
-        ("aarch64", "tvos") => "appletvos",
-        ("x86_64", "tvos") => "appletvsimulator",
-        ("arm", "ios") => "iphoneos",
-        ("aarch64", "ios") if llvm_target.contains("macabi") => "macosx",
-        ("aarch64", "ios") if llvm_target.ends_with("-simulator") => "iphonesimulator",
-        ("aarch64", "ios") => "iphoneos",
-        ("x86", "ios") => "iphonesimulator",
-        ("x86_64", "ios") if llvm_target.contains("macabi") => "macosx",
-        ("x86_64", "ios") => "iphonesimulator",
-        ("x86_64", "watchos") => "watchsimulator",
-        ("arm64_32", "watchos") => "watchos",
-        ("aarch64", "watchos") if llvm_target.ends_with("-simulator") => "watchsimulator",
-        ("aarch64", "watchos") => "watchos",
-        ("aarch64", "visionos") if llvm_target.ends_with("-simulator") => "xrsimulator",
-        ("aarch64", "visionos") => "xros",
-        ("arm", "watchos") => "watchos",
-        (_, "macos") => "macosx",
-        _ => {
-            sess.dcx().emit_err(errors::UnsupportedArch { arch, os });
-            return None;
-        }
-    };
-    let sdk_root = match get_apple_sdk_root(sdk_name) {
-        Ok(s) => s,
-        Err(e) => {
-            sess.dcx().emit_err(e);
-            return None;
-        }
-    };
+    let sdk_root = sess.time("get_apple_sdk_root", || get_apple_sdk_root(sess))?;
 
     match flavor {
         LinkerFlavor::Darwin(Cc::Yes, _) => {
@@ -3255,28 +3222,32 @@ fn add_apple_sdk(cmd: &mut dyn Linker, sess: &Session, flavor: LinkerFlavor) -> 
             // This is admittedly a bit strange, as on most targets
             // `-isysroot` only applies to include header files, but on Apple
             // targets this also applies to libraries and frameworks.
-            cmd.cc_args(&["-isysroot", &sdk_root]);
+            cmd.cc_arg("-isysroot");
+            cmd.cc_arg(&sdk_root);
         }
         LinkerFlavor::Darwin(Cc::No, _) => {
-            cmd.link_args(&["-syslibroot", &sdk_root]);
+            cmd.link_arg("-syslibroot");
+            cmd.link_arg(&sdk_root);
         }
         _ => unreachable!(),
     }
 
-    Some(sdk_root.into())
+    Some(sdk_root)
 }
 
-fn get_apple_sdk_root(sdk_name: &str) -> Result<String, errors::AppleSdkRootError<'_>> {
-    // Following what clang does
-    // (https://github.com/llvm/llvm-project/blob/
-    // 296a80102a9b72c3eda80558fb78a3ed8849b341/clang/lib/Driver/ToolChains/Darwin.cpp#L1661-L1678)
-    // to allow the SDK path to be set. (For clang, xcrun sets
-    // SDKROOT; for rustc, the user or build system can set it, or we
-    // can fall back to checking for xcrun on PATH.)
+fn get_apple_sdk_root(sess: &Session) -> Option<PathBuf> {
     if let Ok(sdkroot) = env::var("SDKROOT") {
-        let p = Path::new(&sdkroot);
-        match sdk_name {
-            // Ignore `SDKROOT` if it's clearly set for the wrong platform.
+        let p = PathBuf::from(&sdkroot);
+
+        // Ignore invalid SDKs, similar to what clang does:
+        // https://github.com/llvm/llvm-project/blob/llvmorg-19.1.6/clang/lib/Driver/ToolChains/Darwin.cpp#L2212-L2229
+        //
+        // NOTE: Things are complicated here by the fact that `rustc` can be run by Cargo to compile
+        // build scripts and proc-macros for the host, and thus we need to ignore SDKROOT if it's
+        // clearly set for the wrong platform.
+        //
+        // FIXME(madsmtm): Make this more robust (maybe read `SDKSettings.json` like Clang does?).
+        match &*apple::sdk_name(&sess.target).to_lowercase() {
             "appletvos"
                 if sdkroot.contains("TVSimulator.platform")
                     || sdkroot.contains("MacOSX.platform") => {}
@@ -3303,26 +3274,11 @@ fn get_apple_sdk_root(sdk_name: &str) -> Result<String, errors::AppleSdkRootErro
                 if sdkroot.contains("XROS.platform") || sdkroot.contains("MacOSX.platform") => {}
             // Ignore `SDKROOT` if it's not a valid path.
             _ if !p.is_absolute() || p == Path::new("/") || !p.exists() => {}
-            _ => return Ok(sdkroot),
+            _ => return Some(p),
         }
     }
-    let res =
-        Command::new("xcrun").arg("--show-sdk-path").arg("-sdk").arg(sdk_name).output().and_then(
-            |output| {
-                if output.status.success() {
-                    Ok(String::from_utf8(output.stdout).unwrap())
-                } else {
-                    let error = String::from_utf8(output.stderr);
-                    let error = format!("process exit with error: {}", error.unwrap());
-                    Err(io::Error::new(io::ErrorKind::Other, &error[..]))
-                }
-            },
-        );
 
-    match res {
-        Ok(output) => Ok(output.trim().to_string()),
-        Err(error) => Err(errors::AppleSdkRootError::SdkPath { sdk_name, error }),
-    }
+    apple::get_sdk_root(sess)
 }
 
 /// When using the linker flavors opting in to `lld`, add the necessary paths and arguments to

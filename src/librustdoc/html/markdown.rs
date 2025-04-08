@@ -1201,11 +1201,12 @@ impl LangString {
                         seen_rust_tags = !seen_other_tags;
                     }
                     LangStringToken::LangToken(x)
-                        if let Some(ignore) = x.strip_prefix("ignore-")
-                            && enable_per_target_ignores =>
+                        if let Some(ignore) = x.strip_prefix("ignore-") =>
                     {
-                        ignores.push(ignore.to_owned());
-                        seen_rust_tags = !seen_other_tags;
+                        if enable_per_target_ignores {
+                            ignores.push(ignore.to_owned());
+                            seen_rust_tags = !seen_other_tags;
+                        }
                     }
                     LangStringToken::LangToken("rust") => {
                         data.rust = true;
@@ -1723,6 +1724,7 @@ pub(crate) fn markdown_links<'md, R>(
     md: &'md str,
     preprocess_link: impl Fn(MarkdownLink) -> Option<R>,
 ) -> Vec<R> {
+    use itertools::Itertools;
     if md.is_empty() {
         return vec![];
     }
@@ -1881,7 +1883,7 @@ pub(crate) fn markdown_links<'md, R>(
     let mut links = Vec::new();
 
     let mut refdefs = FxIndexMap::default();
-    for (label, refdef) in event_iter.reference_definitions().iter() {
+    for (label, refdef) in event_iter.reference_definitions().iter().sorted_by_key(|x| x.0) {
         refdefs.insert(label.to_string(), (false, refdef.dest.to_string(), refdef.span.clone()));
     }
 

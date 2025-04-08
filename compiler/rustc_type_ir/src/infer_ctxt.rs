@@ -66,6 +66,14 @@ pub enum TypingMode<I: Interner> {
     /// }
     /// ```
     Analysis { defining_opaque_types: I::DefiningOpaqueTypes },
+    /// The behavior during MIR borrowck is identical to `TypingMode::Analysis`
+    /// except that the initial value for opaque types is the type computed during
+    /// HIR typeck with unique unconstrained region inference variables.
+    ///
+    /// This is currently only used with by the new solver as it results in new
+    /// non-universal defining uses of opaque types, which is a breaking change.
+    /// See tests/ui/impl-trait/non-defining-use/as-projection-term.rs.
+    Borrowck { defining_opaque_types: I::DefiningOpaqueTypes },
     /// Any analysis after borrowck for a given body should be able to use all the
     /// hidden types defined by borrowck, without being able to define any new ones.
     ///
@@ -95,6 +103,10 @@ impl<I: Interner> TypingMode<I> {
         TypingMode::Analysis { defining_opaque_types: cx.opaque_types_defined_by(body_def_id) }
     }
 
+    pub fn borrowck(cx: I, body_def_id: I::LocalDefId) -> TypingMode<I> {
+        TypingMode::Borrowck { defining_opaque_types: cx.opaque_types_defined_by(body_def_id) }
+    }
+
     pub fn post_borrowck_analysis(cx: I, body_def_id: I::LocalDefId) -> TypingMode<I> {
         TypingMode::PostBorrowckAnalysis {
             defined_opaque_types: cx.opaque_types_defined_by(body_def_id),
@@ -102,6 +114,7 @@ impl<I: Interner> TypingMode<I> {
     }
 }
 
+#[cfg_attr(feature = "nightly", rustc_diagnostic_item = "type_ir_infer_ctxt_like")]
 pub trait InferCtxtLike: Sized {
     type Interner: Interner;
     fn cx(&self) -> Self::Interner;

@@ -352,7 +352,7 @@ pub struct CodegenContext<B: WriteBackendMethods> {
     pub is_pe_coff: bool,
     pub target_can_use_split_dwarf: bool,
     pub target_arch: String,
-    pub target_is_like_osx: bool,
+    pub target_is_like_darwin: bool,
     pub target_is_like_aix: bool,
     pub split_debuginfo: rustc_target::spec::SplitDebuginfo,
     pub split_dwarf_kind: rustc_session::config::SplitDwarfKind,
@@ -1216,7 +1216,7 @@ fn start_executing_work<B: ExtraBackendMethods>(
         is_pe_coff: tcx.sess.target.is_like_windows,
         target_can_use_split_dwarf: tcx.sess.target_can_use_split_dwarf(),
         target_arch: tcx.sess.target.arch.to_string(),
-        target_is_like_osx: tcx.sess.target.is_like_osx,
+        target_is_like_darwin: tcx.sess.target.is_like_darwin,
         target_is_like_aix: tcx.sess.target.is_like_aix,
         split_debuginfo: tcx.sess.split_debuginfo(),
         split_dwarf_kind: tcx.sess.opts.unstable_opts.split_dwarf_kind,
@@ -2186,7 +2186,7 @@ fn msvc_imps_needed(tcx: TyCtxt<'_>) -> bool {
     // indirectly from ThinLTO. In theory these are not needed as ThinLTO could resolve
     // these, but it currently does not do so.
     let can_have_static_objects =
-        tcx.sess.lto() == Lto::Thin || tcx.crate_types().iter().any(|ct| *ct == CrateType::Rlib);
+        tcx.sess.lto() == Lto::Thin || tcx.crate_types().contains(&CrateType::Rlib);
 
     tcx.sess.target.is_like_windows &&
     can_have_static_objects   &&

@@ -7,6 +7,8 @@ pub mod tls;
 use std::assert_matches::{assert_matches, debug_assert_matches};
 use std::borrow::Borrow;
 use std::cmp::Ordering;
+use std::env::VarError;
+use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::{Bound, Deref};
@@ -203,6 +205,9 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
 
     fn type_of(self, def_id: DefId) -> ty::EarlyBinder<'tcx, Ty<'tcx>> {
         self.type_of(def_id)
+    }
+    fn type_of_opaque_hir_typeck(self, def_id: LocalDefId) -> ty::EarlyBinder<'tcx, Ty<'tcx>> {
+        self.type_of_opaque_hir_typeck(def_id)
     }
 
     type AdtDef = ty::AdtDef<'tcx>;
@@ -442,6 +447,10 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
 
     fn is_lang_item(self, def_id: DefId, lang_item: TraitSolverLangItem) -> bool {
         self.is_lang_item(def_id, trait_lang_item_to_lang_item(lang_item))
+    }
+
+    fn is_default_trait(self, def_id: DefId) -> bool {
+        self.is_default_trait(def_id)
     }
 
     fn as_lang_item(self, def_id: DefId) -> Option<TraitSolverLangItem> {
@@ -1288,7 +1297,8 @@ impl<'tcx> TyCtxtFeed<'tcx, LocalDefId> {
         let bodies = Default::default();
         let attrs = hir::AttributeMap::EMPTY;
 
-        let (opt_hash_including_bodies, _) = self.tcx.hash_owner_nodes(node, &bodies, &attrs.map);
+        let (opt_hash_including_bodies, _) =
+            self.tcx.hash_owner_nodes(node, &bodies, &attrs.map, attrs.define_opaque);
         let node = node.into();
         self.opt_hir_owner_nodes(Some(self.tcx.arena.alloc(hir::OwnerNodes {
             opt_hash_including_bodies,
@@ -1536,6 +1546,25 @@ impl<'tcx> TyCtxt<'tcx> {
         self.reserve_and_set_memory_dedup(alloc, salt)
     }
 
+    pub fn default_traits(self) -> &'static [rustc_hir::LangItem] {
+        match self.sess.opts.unstable_opts.experimental_default_bounds {
+            true => &[
+                LangItem::Sized,
+                LangItem::DefaultTrait1,
+                LangItem::DefaultTrait2,
+                LangItem::DefaultTrait3,
+                LangItem::DefaultTrait4,
+            ],
+            false => &[LangItem::Sized],
+        }
+    }
+
+    pub fn is_default_trait(self, def_id: DefId) -> bool {
+        self.default_traits()
+            .iter()
+            .any(|&default_trait| self.lang_items().get(default_trait) == Some(def_id))
+    }
+
     /// Returns a range of the start/end indices specified with the
     /// `rustc_layout_scalar_valid_range` attribute.
     // FIXME(eddyb) this is an awkward spot for this method, maybe move it?
@@ -1778,10 +1807,15 @@ impl<'tcx> TyCtxt<'tcx> {
         // - needs_metadata: for putting into crate metadata.
         // - instrument_coverage: for putting into coverage data (see
         //   `hash_mir_source`).
+        // - metrics_dir: metrics use the strict version hash in the filenames
+        //   for dumped metrics files to prevent overwriting distinct metrics
+        //   for similar source builds (may change in the future, this is part
+        //   of the proof of concept impl for the metrics initiative project goal)
         cfg!(debug_assertions)
             || self.sess.opts.incremental.is_some()
             || self.needs_metadata()
             || self.sess.instrument_coverage()
+            || self.sess.opts.unstable_opts.metrics_dir.is_some()
     }
 
     #[inline]
@@ -1882,6 +1916,15 @@ impl<'tcx> TyCtxt<'tcx> {
         }
         None
     }
+
+    /// Helper to get a tracked environment variable via. [`TyCtxt::env_var_os`] and converting to
+    /// UTF-8 like [`std::env::var`].
+    pub fn env_var<K: ?Sized + AsRef<OsStr>>(self, key: &'tcx K) -> Result<&'tcx str, VarError> {
+        match self.env_var_os(key.as_ref()) {
+            Some(value) => value.to_str().ok_or_else(|| VarError::NotUnicode(value.to_os_string())),
+            None => Err(VarError::NotPresent),
+        }
+    }
 }
 
 impl<'tcx> TyCtxtAt<'tcx> {
@@ -1918,10 +1961,10 @@ impl<'tcx> TyCtxt<'tcx> {
         // As a consequence, this LocalDefId is always re-created before it is needed by the incr.
         // comp. engine itself.
         //
-        // This call also writes to the value of `source_span` and `expn_that_defined` queries.
+        // This call also writes to the value of the `source_span` query.
         // This is fine because:
-        // - those queries are `eval_always` so we won't miss their result changing;
-        // - this write will have happened before these queries are called.
+        // - that query is `eval_always` so we won't miss its result changing;
+        // - this write will have happened before that query is called.
         let def_id = self.untracked.definitions.write().create_def(parent, data);
 
         // This function modifies `self.definitions` using a side-effect.
@@ -3010,8 +3053,8 @@ impl<'tcx> TyCtxt<'tcx> {
         span: impl Into<MultiSpan>,
         decorator: impl for<'a> LintDiagnostic<'a, ()>,
     ) {
-        let (level, src) = self.lint_level_at_node(lint, hir_id);
-        lint_level(self.sess, lint, level, src, Some(span.into()), |lint| {
+        let level = self.lint_level_at_node(lint, hir_id);
+        lint_level(self.sess, lint, level, Some(span.into()), |lint| {
             decorator.decorate_lint(lint);
         })
     }
@@ -3028,8 +3071,8 @@ impl<'tcx> TyCtxt<'tcx> {
         span: impl Into<MultiSpan>,
         decorate: impl for<'a, 'b> FnOnce(&'b mut Diag<'a, ()>),
     ) {
-        let (level, src) = self.lint_level_at_node(lint, hir_id);
-        lint_level(self.sess, lint, level, src, Some(span.into()), decorate);
+        let level = self.lint_level_at_node(lint, hir_id);
+        lint_level(self.sess, lint, level, Some(span.into()), decorate);
     }
 
     /// Find the crate root and the appropriate span where `use` and outer attributes can be
@@ -3096,8 +3139,8 @@ impl<'tcx> TyCtxt<'tcx> {
         id: HirId,
         decorate: impl for<'a, 'b> FnOnce(&'b mut Diag<'a, ()>),
     ) {
-        let (level, src) = self.lint_level_at_node(lint, id);
-        lint_level(self.sess, lint, level, src, None, decorate);
+        let level = self.lint_level_at_node(lint, id);
+        lint_level(self.sess, lint, level, None, decorate);
     }
 
     pub fn in_scope_traits(self, id: HirId) -> Option<&'tcx [TraitCandidate]> {
@@ -3234,6 +3277,11 @@ impl<'tcx> TyCtxt<'tcx> {
 
     pub fn next_trait_solver_in_coherence(self) -> bool {
         self.sess.opts.unstable_opts.next_solver.coherence
+    }
+
+    #[allow(rustc::bad_opt_access)]
+    pub fn use_typing_mode_borrowck(self) -> bool {
+        self.next_trait_solver_globally() || self.sess.opts.unstable_opts.typing_mode_borrowck
     }
 
     pub fn is_impl_trait_in_trait(self, def_id: DefId) -> bool {

@@ -29,7 +29,7 @@ use rustc_target::asm::InlineAsmArch;
 use rustc_target::spec::{
     CodeModel, DebuginfoKind, PanicStrategy, RelocModel, RelroLevel, SanitizerSet,
     SmallDataThresholdSupport, SplitDebuginfo, StackProtector, SymbolVisibility, Target,
-    TargetTuple, TlsModel,
+    TargetTuple, TlsModel, apple,
 };
 
 use crate::code_stats::CodeStats;
@@ -381,6 +381,10 @@ impl Session {
         self.opts.unstable_opts.sanitizer_cfi_normalize_integers == Some(true)
     }
 
+    pub fn is_sanitizer_kcfi_arity_enabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer_kcfi_arity == Some(true)
+    }
+
     pub fn is_sanitizer_kcfi_enabled(&self) -> bool {
         self.opts.unstable_opts.sanitizer.contains(SanitizerSet::KCFI)
     }
@@ -585,6 +589,14 @@ impl Session {
             .default_visibility
             .or(self.target.options.default_visibility)
             .unwrap_or(SymbolVisibility::Interposable)
+    }
+
+    pub fn staticlib_components(&self, verbatim: bool) -> (&str, &str) {
+        if verbatim {
+            ("", "")
+        } else {
+            (&*self.target.staticlib_prefix, &*self.target.staticlib_suffix)
+        }
     }
 }
 
@@ -881,6 +893,45 @@ impl Session {
             FileNameDisplayPreference::Remapped
         } else {
             FileNameDisplayPreference::Local
+        }
+    }
+
+    /// Get the deployment target on Apple platforms based on the standard environment variables,
+    /// or fall back to the minimum version supported by `rustc`.
+    ///
+    /// This should be guarded behind `if sess.target.is_like_darwin`.
+    pub fn apple_deployment_target(&self) -> apple::OSVersion {
+        let min = apple::OSVersion::minimum_deployment_target(&self.target);
+        let env_var = apple::deployment_target_env_var(&self.target.os);
+
+        // FIXME(madsmtm): Track changes to this.
+        if let Ok(deployment_target) = env::var(env_var) {
+            match apple::OSVersion::from_str(&deployment_target) {
+                Ok(version) => {
+                    let os_min = apple::OSVersion::os_minimum_deployment_target(&self.target.os);
+                    // It is common that the deployment target is set a bit too low, for example on
+                    // macOS Aarch64 to also target older x86_64. So we only want to warn when variable
+                    // is lower than the minimum OS supported by rustc, not when the variable is lower
+                    // than the minimum for a specific target.
+                    if version < os_min {
+                        self.dcx().emit_warn(errors::AppleDeploymentTarget::TooLow {
+                            env_var,
+                            version: version.fmt_pretty().to_string(),
+                            os_min: os_min.fmt_pretty().to_string(),
+                        });
+                    }
+
+                    // Raise the deployment target to the minimum supported.
+                    version.max(min)
+                }
+                Err(error) => {
+                    self.dcx().emit_err(errors::AppleDeploymentTarget::Invalid { env_var, error });
+                    min
+                }
+            }
+        } else {
+            // If no deployment target variable is set, default to the minimum found above.
+            min
         }
     }
 }
@@ -1201,6 +1252,11 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
         if !sess.is_sanitizer_cfi_enabled() {
             sess.dcx().emit_err(errors::SanitizerCfiCanonicalJumpTablesRequiresCfi);
         }
+    }
+
+    // KCFI arity indicator requires KCFI.
+    if sess.is_sanitizer_kcfi_arity_enabled() && !sess.is_sanitizer_kcfi_enabled() {
+        sess.dcx().emit_err(errors::SanitizerKcfiArityRequiresKcfi);
     }
 
     // LLVM CFI pointer generalization requires CFI or KCFI.

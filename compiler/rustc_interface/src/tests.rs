@@ -787,6 +787,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(direct_access_external_data, Some(true));
     tracked!(dual_proc_macros, true);
     tracked!(dwarf_version, Some(5));
+    tracked!(embed_metadata, false);
     tracked!(embed_source, true);
     tracked!(emit_thin_lto, false);
     tracked!(emscripten_wasm_eh, true);
@@ -852,6 +853,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(sanitizer_cfi_generalize_pointers, Some(true));
     tracked!(sanitizer_cfi_normalize_integers, Some(true));
     tracked!(sanitizer_dataflow_abilist, vec![String::from("/rustc/abc")]);
+    tracked!(sanitizer_kcfi_arity, Some(true));
     tracked!(sanitizer_memory_track_origins, 2);
     tracked!(sanitizer_recover, SanitizerSet::ADDRESS);
     tracked!(saturating_float_casts, Some(true));

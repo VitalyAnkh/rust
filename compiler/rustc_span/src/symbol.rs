@@ -131,7 +131,7 @@ symbols! {
         // tidy-alphabetical-end
 
         // Weak keywords, have special meaning only in specific contexts.
-        // Matching predicates: none
+        // Matching predicates: `is_weak`
         // tidy-alphabetical-start
         Auto:               "auto",
         Builtin:            "builtin",
@@ -623,6 +623,7 @@ symbols! {
         cfg_target_has_atomic_equal_alignment,
         cfg_target_thread_local,
         cfg_target_vendor,
+        cfg_trace: "<cfg>", // must not be a valid identifier
         cfg_ub_checks,
         cfg_version,
         cfi,
@@ -799,6 +800,15 @@ symbols! {
         default_fn,
         default_lib_allocator,
         default_method_body_is_const,
+        // --------------------------
+        // Lang items which are used only for experiments with auto traits with default bounds.
+        // These lang items are not actually defined in core/std. Experiment is a part of
+        // `MCP: Low level components for async drop`(https://github.com/rust-lang/compiler-team/issues/727)
+        default_trait1,
+        default_trait2,
+        default_trait3,
+        default_trait4,
+        // --------------------------
         default_type_parameter_fallback,
         default_type_params,
         define_opaque,
@@ -985,6 +995,7 @@ symbols! {
         field_init_shorthand,
         file,
         file_options,
+        flags,
         float,
         float_to_int_unchecked,
         floorf128,
@@ -1376,6 +1387,7 @@ symbols! {
         movbe_target_feature,
         move_ref_pattern,
         move_size_limit,
+        movrs_target_feature,
         mul,
         mul_assign,
         mul_with_overflow,
@@ -1569,6 +1581,7 @@ symbols! {
         pointer_like,
         poll,
         poll_next,
+        position,
         post_dash_lto: "post-lto",
         postfix_match,
         powerpc_target_feature,
@@ -1584,6 +1597,7 @@ symbols! {
         precise_capturing,
         precise_capturing_in_traits,
         precise_pointer_size_matching,
+        precision,
         pref_align_of,
         prefetch_read_data,
         prefetch_read_instruction,
@@ -1770,6 +1784,7 @@ symbols! {
         rustc_deallocator,
         rustc_def_path,
         rustc_default_body_unstable,
+        rustc_delayed_bug_from_inside_query,
         rustc_deny_explicit_impl,
         rustc_deprecated_safe_2024,
         rustc_diagnostic_item,
@@ -1786,7 +1801,6 @@ symbols! {
         rustc_dump_user_args,
         rustc_dump_vtable,
         rustc_effective_visibility,
-        rustc_error,
         rustc_evaluate_where_clauses,
         rustc_expected_cgu_reuse,
         rustc_force_inline,
@@ -2035,6 +2049,7 @@ symbols! {
         sub_assign,
         sub_with_overflow,
         suggestion,
+        super_let,
         supertrait_item_shadowing,
         surface_async_drop_in_place,
         sym,
@@ -2118,7 +2133,9 @@ symbols! {
         type_changing_struct_update,
         type_const,
         type_id,
+        type_ir_infer_ctxt_like,
         type_ir_inherent,
+        type_ir_interner,
         type_length_limit,
         type_macros,
         type_name,
@@ -2271,6 +2288,7 @@ symbols! {
         wasm_target_feature,
         where_clause_attrs,
         while_let,
+        width,
         windows,
         windows_subsystem,
         with_negative_coherence,
@@ -2716,6 +2734,10 @@ impl Symbol {
             || self.is_unused_keyword_always()
             || self.is_used_keyword_conditional(edition)
             || self.is_unused_keyword_conditional(edition)
+    }
+
+    pub fn is_weak(self) -> bool {
+        self >= kw::Auto && self <= kw::Yeet
     }
 
     /// A keyword or reserved identifier that can be used as a path segment.

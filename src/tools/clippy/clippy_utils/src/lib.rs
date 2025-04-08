@@ -114,6 +114,7 @@ use rustc_hir::{
 use rustc_lexer::{TokenKind, tokenize};
 use rustc_lint::{LateContext, Level, Lint, LintContext};
 use rustc_middle::hir::place::PlaceBase;
+use rustc_middle::lint::LevelAndSource;
 use rustc_middle::mir::{AggregateKind, Operand, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind};
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, AutoBorrow};
 use rustc_middle::ty::fast_reject::SimplifiedType;
@@ -1857,6 +1858,7 @@ pub fn is_refutable(cx: &LateContext<'_>, pat: &Pat<'_>) -> bool {
     }
 
     match pat.kind {
+        PatKind::Missing => unreachable!(),
         PatKind::Wild | PatKind::Never => false, // If `!` typechecked then the type is empty, so not refutable.
         PatKind::Binding(_, _, _, pat) => pat.is_some_and(|pat| is_refutable(cx, pat)),
         PatKind::Box(pat) | PatKind::Ref(pat, _) => is_refutable(cx, pat),
@@ -1976,14 +1978,14 @@ pub fn fulfill_or_allowed(cx: &LateContext<'_>, lint: &'static Lint, ids: impl I
     let mut suppress_lint = false;
 
     for id in ids {
-        let (level, _) = cx.tcx.lint_level_at_node(lint, id);
-        if let Some(expectation) = level.get_expectation_id() {
+        let LevelAndSource { level, lint_id, .. } = cx.tcx.lint_level_at_node(lint, id);
+        if let Some(expectation) = lint_id {
             cx.fulfill_expectation(expectation);
         }
 
         match level {
-            Level::Allow | Level::Expect(_) => suppress_lint = true,
-            Level::Warn | Level::ForceWarn(_) | Level::Deny | Level::Forbid => {},
+            Level::Allow | Level::Expect => suppress_lint = true,
+            Level::Warn | Level::ForceWarn | Level::Deny | Level::Forbid => {},
         }
     }
 
@@ -1998,7 +2000,7 @@ pub fn fulfill_or_allowed(cx: &LateContext<'_>, lint: &'static Lint, ids: impl I
 /// make sure to use `span_lint_hir` functions to emit the lint. This ensures that
 /// expectations at the checked nodes will be fulfilled.
 pub fn is_lint_allowed(cx: &LateContext<'_>, lint: &'static Lint, id: HirId) -> bool {
-    cx.tcx.lint_level_at_node(lint, id).0 == Level::Allow
+    cx.tcx.lint_level_at_node(lint, id).level == Level::Allow
 }
 
 pub fn strip_pat_refs<'hir>(mut pat: &'hir Pat<'hir>) -> &'hir Pat<'hir> {
@@ -2629,7 +2631,7 @@ pub fn peel_ref_operators<'hir>(cx: &LateContext<'_>, mut expr: &'hir Expr<'hir>
 pub fn is_hir_ty_cfg_dependant(cx: &LateContext<'_>, ty: &hir::Ty<'_>) -> bool {
     if let TyKind::Path(QPath::Resolved(_, path)) = ty.kind {
         if let Res::Def(_, def_id) = path.res {
-            return cx.tcx.has_attr(def_id, sym::cfg) || cx.tcx.has_attr(def_id, sym::cfg_attr);
+            return cx.tcx.has_attr(def_id, sym::cfg_trace) || cx.tcx.has_attr(def_id, sym::cfg_attr);
         }
     }
     false
@@ -2699,7 +2701,7 @@ pub fn is_in_test_function(tcx: TyCtxt<'_>, id: HirId) -> bool {
 /// use [`is_in_cfg_test`]
 pub fn is_cfg_test(tcx: TyCtxt<'_>, id: HirId) -> bool {
     tcx.hir_attrs(id).iter().any(|attr| {
-        if attr.has_name(sym::cfg)
+        if attr.has_name(sym::cfg_trace)
             && let Some(items) = attr.meta_item_list()
             && let [item] = &*items
             && item.has_name(sym::test)
@@ -2723,11 +2725,11 @@ pub fn is_in_test(tcx: TyCtxt<'_>, hir_id: HirId) -> bool {
 
 /// Checks if the item of any of its parents has `#[cfg(...)]` attribute applied.
 pub fn inherits_cfg(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
-    tcx.has_attr(def_id, sym::cfg)
+    tcx.has_attr(def_id, sym::cfg_trace)
         || tcx
             .hir_parent_iter(tcx.local_def_id_to_hir_id(def_id))
             .flat_map(|(parent_id, _)| tcx.hir_attrs(parent_id))
-            .any(|attr| attr.has_name(sym::cfg))
+            .any(|attr| attr.has_name(sym::cfg_trace))
 }
 
 /// Walks up the HIR tree from the given expression in an attempt to find where the value is
@@ -2990,7 +2992,7 @@ pub fn expr_use_ctxt<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'tcx>) -> ExprU
         {
             adjustments = cx.typeck_results().expr_adjustments(e);
         }
-        same_ctxt &= cx.tcx.hir().span(parent_id).ctxt() == ctxt;
+        same_ctxt &= cx.tcx.hir_span(parent_id).ctxt() == ctxt;
         if let Node::Expr(e) = parent {
             match e.kind {
                 ExprKind::If(e, _, _) | ExprKind::Match(e, _, _) if e.hir_id != child_id => {

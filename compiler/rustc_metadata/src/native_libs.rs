@@ -73,7 +73,7 @@ pub fn walk_native_lib_search_dirs<R>(
         || sess.target.os == "linux"
         || sess.target.os == "fuchsia"
         || sess.target.is_like_aix
-        || sess.target.is_like_osx && !sess.opts.unstable_opts.sanitizer.is_empty()
+        || sess.target.is_like_darwin && !sess.opts.unstable_opts.sanitizer.is_empty()
     {
         f(&sess.target_tlib_path.dir, false)?;
     }
@@ -95,14 +95,14 @@ pub fn try_find_native_static_library(
     name: &str,
     verbatim: bool,
 ) -> Option<PathBuf> {
+    let default = sess.staticlib_components(verbatim);
     let formats = if verbatim {
-        vec![("".into(), "".into())]
+        vec![default]
     } else {
-        let os = (sess.target.staticlib_prefix.clone(), sess.target.staticlib_suffix.clone());
         // On Windows, static libraries sometimes show up as libfoo.a and other
         // times show up as foo.lib
-        let unix = ("lib".into(), ".a".into());
-        if os == unix { vec![os] } else { vec![os, unix] }
+        let unix = ("lib", ".a");
+        if default == unix { vec![default] } else { vec![default, unix] }
     };
 
     walk_native_lib_search_dirs(sess, None, |dir, is_framework| {
@@ -124,18 +124,17 @@ pub fn try_find_native_dynamic_library(
     name: &str,
     verbatim: bool,
 ) -> Option<PathBuf> {
+    let default = sess.staticlib_components(verbatim);
     let formats = if verbatim {
-        vec![("".into(), "".into())]
+        vec![default]
     } else {
         // While the official naming convention for MSVC import libraries
-        // is foo.lib...
-        let os = (sess.target.staticlib_prefix.clone(), sess.target.staticlib_suffix.clone());
-        // ... Meson follows the libfoo.dll.a convention to
+        // is foo.lib, Meson follows the libfoo.dll.a convention to
         // disambiguate .a for static libraries
-        let meson = ("lib".into(), ".dll.a".into());
+        let meson = ("lib", ".dll.a");
         // and MinGW uses .a altogether
-        let mingw = ("lib".into(), ".a".into());
-        vec![os, meson, mingw]
+        let mingw = ("lib", ".a");
+        vec![default, meson, mingw]
     };
 
     walk_native_lib_search_dirs(sess, None, |dir, is_framework| {
@@ -208,7 +207,7 @@ impl<'tcx> Collector<'tcx> {
 
         let sess = self.tcx.sess;
 
-        if matches!(abi, ExternAbi::Rust | ExternAbi::RustIntrinsic) {
+        if matches!(abi, ExternAbi::Rust) {
             return;
         }
 
@@ -258,7 +257,7 @@ impl<'tcx> Collector<'tcx> {
                             "static" => NativeLibKind::Static { bundle: None, whole_archive: None },
                             "dylib" => NativeLibKind::Dylib { as_needed: None },
                             "framework" => {
-                                if !sess.target.is_like_osx {
+                                if !sess.target.is_like_darwin {
                                     sess.dcx().emit_err(errors::LinkFrameworkApple { span });
                                 }
                                 NativeLibKind::Framework { as_needed: None }
@@ -532,7 +531,7 @@ impl<'tcx> Collector<'tcx> {
         let mut renames = FxHashSet::default();
         for lib in &self.tcx.sess.opts.libs {
             if let NativeLibKind::Framework { .. } = lib.kind
-                && !self.tcx.sess.target.is_like_osx
+                && !self.tcx.sess.target.is_like_darwin
             {
                 // Cannot check this when parsing options because the target is not yet available.
                 self.tcx.dcx().emit_err(errors::LibFrameworkApple);

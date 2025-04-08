@@ -115,11 +115,10 @@ impl<'tcx> MatchPairTree<'tcx> {
             place_builder = place_builder.project(ProjectionElem::OpaqueCast(pattern.ty));
         }
 
-        // Place can be none if the pattern refers to a non-captured place in a closure.
         let place = place_builder.try_to_place(cx);
         let mut subpairs = Vec::new();
         let test_case = match pattern.kind {
-            PatKind::Wild | PatKind::Error(_) => None,
+            PatKind::Missing | PatKind::Wild | PatKind::Error(_) => None,
 
             PatKind::Or { ref pats } => Some(TestCase::Or {
                 pats: pats.iter().map(|pat| FlatPat::new(place_builder.clone(), pat, cx)).collect(),
@@ -202,37 +201,8 @@ impl<'tcx> MatchPairTree<'tcx> {
                 None
             }
 
-            PatKind::ExpandedConstant { subpattern: ref pattern, def_id: _, is_inline: false } => {
+            PatKind::ExpandedConstant { subpattern: ref pattern, .. } => {
                 MatchPairTree::for_pattern(place_builder, pattern, cx, &mut subpairs, extra_data);
-                None
-            }
-            PatKind::ExpandedConstant { subpattern: ref pattern, def_id, is_inline: true } => {
-                MatchPairTree::for_pattern(place_builder, pattern, cx, &mut subpairs, extra_data);
-
-                // Apply a type ascription for the inline constant to the value at `match_pair.place`
-                if let Some(source) = place {
-                    let span = pattern.span;
-                    let parent_id = cx.tcx.typeck_root_def_id(cx.def_id.to_def_id());
-                    let args = ty::InlineConstArgs::new(
-                        cx.tcx,
-                        ty::InlineConstArgsParts {
-                            parent_args: ty::GenericArgs::identity_for_item(cx.tcx, parent_id),
-                            ty: cx.infcx.next_ty_var(span),
-                        },
-                    )
-                    .args;
-                    let user_ty = cx.infcx.canonicalize_user_type_annotation(ty::UserType::new(
-                        ty::UserTypeKind::TypeOf(def_id, ty::UserArgs { args, user_self_ty: None }),
-                    ));
-                    let annotation = ty::CanonicalUserTypeAnnotation {
-                        inferred_ty: pattern.ty,
-                        span,
-                        user_ty: Box::new(user_ty),
-                    };
-                    let variance = ty::Contravariant;
-                    extra_data.ascriptions.push(super::Ascription { annotation, source, variance });
-                }
-
                 None
             }
 
@@ -321,7 +291,7 @@ impl<'tcx> MatchPairTree<'tcx> {
         if let Some(test_case) = test_case {
             // This pattern is refutable, so push a new match-pair node.
             match_pairs.push(MatchPairTree {
-                place: place.expect("refutable patterns should always have a place to inspect"),
+                place,
                 test_case,
                 subpairs,
                 pattern_ty: pattern.ty,
