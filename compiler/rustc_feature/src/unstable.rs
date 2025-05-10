@@ -316,6 +316,7 @@ declare_features! (
     // Unstable `#[target_feature]` directives.
     (unstable, aarch64_unstable_target_feature, "1.82.0", Some(44839)),
     (unstable, aarch64_ver_target_feature, "1.27.0", Some(44839)),
+    (unstable, apx_target_feature, "CURRENT_RUSTC_VERSION", Some(139284)),
     (unstable, arm_target_feature, "1.27.0", Some(44839)),
     (unstable, avx512_target_feature, "1.27.0", Some(44839)),
     (unstable, bpf_target_feature, "1.54.0", Some(44839)),
@@ -510,6 +511,8 @@ declare_features! (
     (incomplete, fn_delegation, "1.76.0", Some(118212)),
     /// Allows impls for the Freeze trait.
     (internal, freeze_impls, "1.78.0", Some(121675)),
+    /// Frontmatter `---` blocks for use by external tools.
+    (unstable, frontmatter, "CURRENT_RUSTC_VERSION", Some(136889)),
     /// Allows defining gen blocks and `gen fn`.
     (unstable, gen_blocks, "1.75.0", Some(117078)),
     /// Infer generic args for both consts and types.

@@ -961,6 +961,7 @@ impl<'a> Builder<'a> {
                 check::RunMakeSupport,
                 check::Compiletest,
                 check::FeaturesStatusDump,
+                check::CoverageDump,
             ),
             Kind::Test => describe!(
                 crate::core::build_steps::toolstate::ToolStateCheck,
@@ -1114,6 +1115,8 @@ impl<'a> Builder<'a> {
                 run::UnicodeTableGenerator,
                 run::FeaturesStatusDump,
                 run::CyclicStep,
+                run::CoverageDump,
+                run::Rustfmt,
             ),
             Kind::Setup => {
                 describe!(setup::Profile, setup::Hook, setup::Link, setup::Editor)
