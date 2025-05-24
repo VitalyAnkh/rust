@@ -387,7 +387,7 @@ rustc_queries! {
         }
     }
 
-    query stalled_generators_within(
+    query nested_bodies_within(
         key: LocalDefId
     ) -> &'tcx ty::List<LocalDefId> {
         desc {
@@ -920,6 +920,12 @@ rustc_queries! {
     query coroutine_for_closure(def_id: DefId) -> DefId {
         desc { |_tcx| "Given a coroutine-closure def id, return the def id of the coroutine returned by it" }
         separate_provide_extern
+    }
+
+    query coroutine_hidden_types(
+        def_id: DefId
+    ) -> ty::EarlyBinder<'tcx, ty::Binder<'tcx, ty::CoroutineWitnessTypes<TyCtxt<'tcx>>>> {
+        desc { "looking up the hidden types stored across await points in a coroutine" }
     }
 
     /// Gets a map with the variances of every item in the local crate.
@@ -2585,6 +2591,11 @@ rustc_queries! {
     query size_estimate(key: ty::Instance<'tcx>) -> usize {
         desc { "estimating codegen size of `{}`", key }
         cache_on_disk_if { true }
+    }
+
+    query anon_const_kind(def_id: DefId) -> ty::AnonConstKind {
+        desc { |tcx| "looking up anon const kind of `{}`", tcx.def_path_str(def_id) }
+        separate_provide_extern
     }
 }
 

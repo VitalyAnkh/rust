@@ -3,8 +3,8 @@ use std::str::FromStr;
 use rustc_abi::ExternAbi;
 use rustc_ast::expand::autodiff_attrs::{AutoDiffAttrs, DiffActivity, DiffMode};
 use rustc_ast::{LitKind, MetaItem, MetaItemInner, attr};
-use rustc_attr_parsing::ReprAttr::ReprAlign;
-use rustc_attr_parsing::{AttributeKind, InlineAttr, InstructionSetAttr, OptimizeAttr};
+use rustc_attr_data_structures::ReprAttr::ReprAlign;
+use rustc_attr_data_structures::{AttributeKind, InlineAttr, InstructionSetAttr, OptimizeAttr};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
@@ -299,6 +299,7 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
                 }
                 from_target_feature_attr(
                     tcx,
+                    did,
                     attr,
                     rust_target_features,
                     &mut codegen_fn_attrs.target_features,
@@ -387,7 +388,7 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
                                 [sym::arm, sym::a32 | sym::t32]
                                     if !tcx.sess.target.has_thumb_interworking =>
                                 {
-                                    tcx.dcx().emit_err(errors::UnsuportedInstructionSet {
+                                    tcx.dcx().emit_err(errors::UnsupportedInstructionSet {
                                         span: attr.span(),
                                     });
                                     None

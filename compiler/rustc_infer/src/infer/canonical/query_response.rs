@@ -132,7 +132,13 @@ impl<'tcx> InferCtxt<'tcx> {
 
         let certainty = if errors.is_empty() { Certainty::Proven } else { Certainty::Ambiguous };
 
-        let opaque_types = self.take_opaque_types_for_query_response();
+        let opaque_types = self
+            .inner
+            .borrow_mut()
+            .opaque_type_storage
+            .take_opaque_types()
+            .map(|(k, v)| (k, v.ty))
+            .collect();
 
         Ok(QueryResponse {
             var_values: inference_vars,
@@ -141,24 +147,6 @@ impl<'tcx> InferCtxt<'tcx> {
             value: answer,
             opaque_types,
         })
-    }
-
-    /// Used by the new solver as that one takes the opaque types at the end of a probe
-    /// to deal with multiple candidates without having to recompute them.
-    pub fn clone_opaque_types_for_query_response(
-        &self,
-    ) -> Vec<(ty::OpaqueTypeKey<'tcx>, Ty<'tcx>)> {
-        self.inner
-            .borrow()
-            .opaque_type_storage
-            .opaque_types
-            .iter()
-            .map(|(k, v)| (*k, v.ty))
-            .collect()
-    }
-
-    fn take_opaque_types_for_query_response(&self) -> Vec<(ty::OpaqueTypeKey<'tcx>, Ty<'tcx>)> {
-        self.take_opaque_types().into_iter().map(|(k, v)| (k, v.ty)).collect()
     }
 
     /// Given the (canonicalized) result to a canonical query,
@@ -457,17 +445,17 @@ impl<'tcx> InferCtxt<'tcx> {
         // a fresh inference variable.
         let result_args = CanonicalVarValues {
             var_values: self.tcx.mk_args_from_iter(
-                query_response.variables.iter().enumerate().map(|(index, info)| {
-                    if info.universe() != ty::UniverseIndex::ROOT {
+                query_response.variables.iter().enumerate().map(|(index, var_kind)| {
+                    if var_kind.universe() != ty::UniverseIndex::ROOT {
                         // A variable from inside a binder of the query. While ideally these shouldn't
                         // exist at all, we have to deal with them for now.
-                        self.instantiate_canonical_var(cause.span, info, |u| {
+                        self.instantiate_canonical_var(cause.span, var_kind, |u| {
                             universe_map[u.as_usize()]
                         })
-                    } else if info.is_existential() {
+                    } else if var_kind.is_existential() {
                         match opt_values[BoundVar::new(index)] {
                             Some(k) => k,
-                            None => self.instantiate_canonical_var(cause.span, info, |u| {
+                            None => self.instantiate_canonical_var(cause.span, var_kind, |u| {
                                 universe_map[u.as_usize()]
                             }),
                         }

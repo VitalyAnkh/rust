@@ -13,7 +13,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rustc_abi::{Align, ExternAbi, Size};
 use rustc_apfloat::{Float, FloatConvert};
-use rustc_attr_parsing::InlineAttr;
+use rustc_attr_data_structures::InlineAttr;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 #[allow(unused)]
 use rustc_data_structures::static_assert_size;
@@ -544,9 +544,6 @@ pub struct MiriMachine<'tcx> {
     /// Failure rate of compare_exchange_weak, between 0.0 and 1.0
     pub(crate) cmpxchg_weak_failure_rate: f64,
 
-    /// Corresponds to -Zmiri-mute-stdout-stderr and doesn't write the output but acts as if it succeeded.
-    pub(crate) mute_stdout_stderr: bool,
-
     /// The probability of the active thread being preempted at the end of each basic block.
     pub(crate) preemption_rate: f64,
 
@@ -614,6 +611,9 @@ pub struct MiriMachine<'tcx> {
 
     /// Cache for `mangle_internal_symbol`.
     pub(crate) mangle_internal_symbol_cache: FxHashMap<&'static str, String>,
+
+    /// Always prefer the intrinsic fallback body over the native Miri implementation.
+    pub force_intrinsic_fallback: bool,
 }
 
 impl<'tcx> MiriMachine<'tcx> {
@@ -719,7 +719,6 @@ impl<'tcx> MiriMachine<'tcx> {
             track_alloc_accesses: config.track_alloc_accesses,
             check_alignment: config.check_alignment,
             cmpxchg_weak_failure_rate: config.cmpxchg_weak_failure_rate,
-            mute_stdout_stderr: config.mute_stdout_stderr,
             preemption_rate: config.preemption_rate,
             report_progress: config.report_progress,
             basic_block_count: 0,
@@ -770,6 +769,7 @@ impl<'tcx> MiriMachine<'tcx> {
             reject_in_isolation_warned: Default::default(),
             int2ptr_warned: Default::default(),
             mangle_internal_symbol_cache: Default::default(),
+            force_intrinsic_fallback: config.force_intrinsic_fallback,
         }
     }
 
@@ -921,7 +921,6 @@ impl VisitProvenance for MiriMachine<'_> {
             track_alloc_accesses: _,
             check_alignment: _,
             cmpxchg_weak_failure_rate: _,
-            mute_stdout_stderr: _,
             preemption_rate: _,
             report_progress: _,
             basic_block_count: _,
@@ -946,6 +945,7 @@ impl VisitProvenance for MiriMachine<'_> {
             reject_in_isolation_warned: _,
             int2ptr_warned: _,
             mangle_internal_symbol_cache: _,
+            force_intrinsic_fallback: _,
         } = self;
 
         threads.visit_provenance(visit);
