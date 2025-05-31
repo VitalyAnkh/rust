@@ -31,7 +31,7 @@ use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::{self, InferKind, Visitor, VisitorExt, walk_generics};
 use rustc_hir::{self as hir, GenericParamKind, HirId, Node, PreciseCapturingArgKind};
 use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
-use rustc_infer::traits::ObligationCause;
+use rustc_infer::traits::{DynCompatibilityViolation, ObligationCause};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::util::{Discr, IntTypeExt};
@@ -40,11 +40,10 @@ use rustc_middle::{bug, span_bug};
 use rustc_span::{DUMMY_SP, Ident, Span, Symbol, kw, sym};
 use rustc_trait_selection::error_reporting::traits::suggestions::NextTypeParamName;
 use rustc_trait_selection::infer::InferCtxtExt;
-use rustc_trait_selection::traits::ObligationCtxt;
+use rustc_trait_selection::traits::{ObligationCtxt, hir_ty_lowering_dyn_compatibility_violations};
 use tracing::{debug, instrument};
 
 use crate::errors;
-use crate::hir_ty_lowering::errors::assoc_tag_str;
 use crate::hir_ty_lowering::{FeedConstTy, HirTyLowerer, RegionInferReason};
 
 pub(crate) mod dump;
@@ -89,6 +88,7 @@ pub(crate) fn provide(providers: &mut Providers) {
         opaque_ty_origin,
         rendered_precise_capturing_args,
         const_param_default,
+        anon_const_kind,
         ..*providers
     };
 }
@@ -444,13 +444,12 @@ impl<'tcx> HirTyLowerer<'tcx> for ItemCtxt<'tcx> {
         self.tcx.at(span).type_param_predicates((self.item_def_id, def_id, assoc_ident))
     }
 
-    fn lower_assoc_shared(
+    fn lower_assoc_item_path(
         &self,
         span: Span,
         item_def_id: DefId,
         item_segment: &rustc_hir::PathSegment<'tcx>,
         poly_trait_ref: ty::PolyTraitRef<'tcx>,
-        assoc_tag: ty::AssocTag,
     ) -> Result<(DefId, ty::GenericArgsRef<'tcx>), ErrorGuaranteed> {
         if let Some(trait_ref) = poly_trait_ref.no_bound_vars() {
             let item_args = self.lowerer().lower_generic_args_of_assoc_item(
@@ -525,7 +524,7 @@ impl<'tcx> HirTyLowerer<'tcx> for ItemCtxt<'tcx> {
                 inferred_sugg,
                 bound,
                 mpart_sugg,
-                what: assoc_tag_str(assoc_tag),
+                what: self.tcx.def_descr(item_def_id),
             }))
         }
     }
@@ -625,6 +624,10 @@ impl<'tcx> HirTyLowerer<'tcx> for ItemCtxt<'tcx> {
         }
 
         (input_tys, output_ty)
+    }
+
+    fn dyn_compatibility_violations(&self, trait_def_id: DefId) -> Vec<DynCompatibilityViolation> {
+        hir_ty_lowering_dyn_compatibility_violations(self.tcx, trait_def_id)
     }
 }
 
@@ -1827,4 +1830,28 @@ fn const_param_default<'tcx>(
         .lowerer()
         .lower_const_arg(default_ct, FeedConstTy::Param(def_id.to_def_id(), identity_args));
     ty::EarlyBinder::bind(ct)
+}
+
+fn anon_const_kind<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> ty::AnonConstKind {
+    let hir_id = tcx.local_def_id_to_hir_id(def);
+    let const_arg_id = tcx.parent_hir_id(hir_id);
+    match tcx.hir_node(const_arg_id) {
+        hir::Node::ConstArg(_) => {
+            if tcx.features().generic_const_exprs() {
+                ty::AnonConstKind::GCE
+            } else if tcx.features().min_generic_const_args() {
+                ty::AnonConstKind::MCG
+            } else if let hir::Node::Expr(hir::Expr {
+                kind: hir::ExprKind::Repeat(_, repeat_count),
+                ..
+            }) = tcx.hir_node(tcx.parent_hir_id(const_arg_id))
+                && repeat_count.hir_id == const_arg_id
+            {
+                ty::AnonConstKind::RepeatExprCount
+            } else {
+                ty::AnonConstKind::MCG
+            }
+        }
+        _ => ty::AnonConstKind::NonTypeSystem,
+    }
 }

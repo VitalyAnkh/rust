@@ -2,7 +2,6 @@
 
 // tidy-alphabetical-start
 #![allow(internal_features)]
-#![cfg_attr(bootstrap, feature(let_chains))]
 #![doc(rust_logo)]
 #![feature(assert_matches)]
 #![feature(box_patterns)]
@@ -41,13 +40,11 @@ use rustc_middle::ty::{
     self, ParamEnv, RegionVid, Ty, TyCtxt, TypeFoldable, TypeVisitable, TypingMode, fold_regions,
 };
 use rustc_middle::{bug, span_bug};
-use rustc_mir_dataflow::impls::{
-    EverInitializedPlaces, MaybeInitializedPlaces, MaybeUninitializedPlaces,
-};
+use rustc_mir_dataflow::impls::{EverInitializedPlaces, MaybeUninitializedPlaces};
 use rustc_mir_dataflow::move_paths::{
     InitIndex, InitLocation, LookupResult, MoveData, MovePathIndex,
 };
-use rustc_mir_dataflow::{Analysis, EntryStates, Results, ResultsVisitor, visit_results};
+use rustc_mir_dataflow::{Analysis, Results, ResultsVisitor, visit_results};
 use rustc_session::lint::builtin::{TAIL_EXPR_DROP_ORDER, UNUSED_MUT};
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
 use smallvec::SmallVec;
@@ -127,6 +124,14 @@ fn mir_borrowck(
         Ok(tcx.arena.alloc(opaque_types))
     } else {
         let mut root_cx = BorrowCheckRootCtxt::new(tcx, def);
+        // We need to manually borrowck all nested bodies from the HIR as
+        // we do not generate MIR for dead code. Not doing so causes us to
+        // never check closures in dead code.
+        let nested_bodies = tcx.nested_bodies_within(def);
+        for def_id in nested_bodies {
+            root_cx.get_or_insert_nested(def_id);
+        }
+
         let PropagatedBorrowCheckResults { closure_requirements, used_mut_upvars } =
             do_mir_borrowck(&mut root_cx, def, None).0;
         debug_assert!(closure_requirements.is_none());
@@ -317,10 +322,6 @@ fn do_mir_borrowck<'tcx>(
 
     let move_data = MoveData::gather_moves(body, tcx, |_| true);
 
-    let flow_inits = MaybeInitializedPlaces::new(tcx, body, &move_data)
-        .iterate_to_fixpoint(tcx, body, Some("borrowck"))
-        .into_results_cursor(body);
-
     let locals_are_invalidated_at_exit = tcx.hir_body_owner_kind(def).is_fn_or_closure();
     let borrow_set = BorrowSet::build(tcx, body, locals_are_invalidated_at_exit, &move_data);
 
@@ -339,7 +340,6 @@ fn do_mir_borrowck<'tcx>(
         body,
         &promoted,
         &location_table,
-        flow_inits,
         &move_data,
         &borrow_set,
         consumer_options,
@@ -461,11 +461,13 @@ fn do_mir_borrowck<'tcx>(
     // Compute and report region errors, if any.
     mbcx.report_region_errors(nll_errors);
 
-    let mut flow_results = get_flow_results(tcx, body, &move_data, &borrow_set, &regioncx);
+    let (mut flow_analysis, flow_entry_states) =
+        get_flow_results(tcx, body, &move_data, &borrow_set, &regioncx);
     visit_results(
         body,
         traversal::reverse_postorder(body).map(|(bb, _)| bb),
-        &mut flow_results,
+        &mut flow_analysis,
+        &flow_entry_states,
         &mut mbcx,
     );
 
@@ -525,7 +527,7 @@ fn get_flow_results<'a, 'tcx>(
     move_data: &'a MoveData<'tcx>,
     borrow_set: &'a BorrowSet<'tcx>,
     regioncx: &RegionInferenceContext<'tcx>,
-) -> Results<'tcx, Borrowck<'a, 'tcx>> {
+) -> (Borrowck<'a, 'tcx>, Results<BorrowckDomain>) {
     // We compute these three analyses individually, but them combine them into
     // a single results so that `mbcx` can visit them all together.
     let borrows = Borrows::new(tcx, body, regioncx, borrow_set).iterate_to_fixpoint(
@@ -550,14 +552,14 @@ fn get_flow_results<'a, 'tcx>(
         ever_inits: ever_inits.analysis,
     };
 
-    assert_eq!(borrows.entry_states.len(), uninits.entry_states.len());
-    assert_eq!(borrows.entry_states.len(), ever_inits.entry_states.len());
-    let entry_states: EntryStates<'_, Borrowck<'_, '_>> =
-        itertools::izip!(borrows.entry_states, uninits.entry_states, ever_inits.entry_states)
+    assert_eq!(borrows.results.len(), uninits.results.len());
+    assert_eq!(borrows.results.len(), ever_inits.results.len());
+    let results: Results<_> =
+        itertools::izip!(borrows.results, uninits.results, ever_inits.results)
             .map(|(borrows, uninits, ever_inits)| BorrowckDomain { borrows, uninits, ever_inits })
             .collect();
 
-    Results { analysis, entry_states }
+    (analysis, results)
 }
 
 pub(crate) struct BorrowckInferCtxt<'tcx> {
@@ -705,7 +707,7 @@ struct MirBorrowckCtxt<'a, 'infcx, 'tcx> {
 impl<'a, 'tcx> ResultsVisitor<'tcx, Borrowck<'a, 'tcx>> for MirBorrowckCtxt<'a, '_, 'tcx> {
     fn visit_after_early_statement_effect(
         &mut self,
-        _results: &mut Results<'tcx, Borrowck<'a, 'tcx>>,
+        _analysis: &mut Borrowck<'a, 'tcx>,
         state: &BorrowckDomain,
         stmt: &Statement<'tcx>,
         location: Location,
@@ -781,7 +783,7 @@ impl<'a, 'tcx> ResultsVisitor<'tcx, Borrowck<'a, 'tcx>> for MirBorrowckCtxt<'a, 
 
     fn visit_after_early_terminator_effect(
         &mut self,
-        _results: &mut Results<'tcx, Borrowck<'a, 'tcx>>,
+        _analysis: &mut Borrowck<'a, 'tcx>,
         state: &BorrowckDomain,
         term: &Terminator<'tcx>,
         loc: Location,
@@ -901,7 +903,7 @@ impl<'a, 'tcx> ResultsVisitor<'tcx, Borrowck<'a, 'tcx>> for MirBorrowckCtxt<'a, 
 
     fn visit_after_primary_terminator_effect(
         &mut self,
-        _results: &mut Results<'tcx, Borrowck<'a, 'tcx>>,
+        _analysis: &mut Borrowck<'a, 'tcx>,
         state: &BorrowckDomain,
         term: &Terminator<'tcx>,
         loc: Location,

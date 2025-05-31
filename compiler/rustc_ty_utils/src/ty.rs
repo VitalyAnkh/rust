@@ -7,7 +7,8 @@ use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{
-    self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor, Upcast, fold_regions,
+    self, Ty, TyCtxt, TypeFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitor, Upcast,
+    fold_regions,
 };
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::{CRATE_DEF_ID, DefId, LocalDefId};
@@ -185,7 +186,7 @@ struct ImplTraitInTraitFinder<'a, 'tcx> {
 }
 
 impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for ImplTraitInTraitFinder<'_, 'tcx> {
-    fn visit_binder<T: TypeVisitable<TyCtxt<'tcx>>>(&mut self, binder: &ty::Binder<'tcx, T>) {
+    fn visit_binder<T: TypeFoldable<TyCtxt<'tcx>>>(&mut self, binder: &ty::Binder<'tcx, T>) {
         self.depth.shift_in(1);
         binder.super_visit_with(self);
         self.depth.shift_out(1);
@@ -273,7 +274,7 @@ fn unsizing_params_for_adt<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> DenseBitSe
     let def = tcx.adt_def(def_id);
     let num_params = tcx.generics_of(def_id).count();
 
-    let maybe_unsizing_param_idx = |arg: ty::GenericArg<'tcx>| match arg.unpack() {
+    let maybe_unsizing_param_idx = |arg: ty::GenericArg<'tcx>| match arg.kind() {
         ty::GenericArgKind::Type(ty) => match ty.kind() {
             ty::Param(p) => Some(p.index),
             _ => None,

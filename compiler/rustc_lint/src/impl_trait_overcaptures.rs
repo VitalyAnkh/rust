@@ -15,7 +15,8 @@ use rustc_middle::ty::relate::{
     Relate, RelateResult, TypeRelation, structurally_relate_consts, structurally_relate_tys,
 };
 use rustc_middle::ty::{
-    self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
+    self, Ty, TyCtxt, TypeFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
+    TypeVisitor,
 };
 use rustc_middle::{bug, span_bug};
 use rustc_session::lint::FutureIncompatibilityReason;
@@ -209,7 +210,7 @@ where
     VarFn: FnOnce() -> FxHashMap<DefId, ty::Variance>,
     OutlivesFn: FnOnce() -> OutlivesEnvironment<'tcx>,
 {
-    fn visit_binder<T: TypeVisitable<TyCtxt<'tcx>>>(&mut self, t: &ty::Binder<'tcx, T>) {
+    fn visit_binder<T: TypeFoldable<TyCtxt<'tcx>>>(&mut self, t: &ty::Binder<'tcx, T>) {
         // When we get into a binder, we need to add its own bound vars to the scope.
         let mut added = vec![];
         for arg in t.bound_vars() {
@@ -460,7 +461,7 @@ fn extract_def_id_from_arg<'tcx>(
     generics: &'tcx ty::Generics,
     arg: ty::GenericArg<'tcx>,
 ) -> DefId {
-    match arg.unpack() {
+    match arg.kind() {
         ty::GenericArgKind::Lifetime(re) => match re.kind() {
             ty::ReEarlyParam(ebr) => generics.region_param(ebr, tcx).def_id,
             ty::ReBound(

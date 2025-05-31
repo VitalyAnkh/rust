@@ -22,11 +22,21 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         &mut self,
         instance: ty::Instance<'tcx>,
         args: &[OpTy<'tcx>],
-        dest: &MPlaceTy<'tcx>,
+        dest: &PlaceTy<'tcx>,
         ret: Option<mir::BasicBlock>,
         unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<ty::Instance<'tcx>>> {
         let this = self.eval_context_mut();
+
+        // Force use of fallback body, if available.
+        if this.machine.force_intrinsic_fallback
+            && !this.tcx.intrinsic(instance.def_id()).unwrap().must_be_overridden
+        {
+            return interp_ok(Some(ty::Instance {
+                def: ty::InstanceKind::Item(instance.def_id()),
+                args: instance.args,
+            }));
+        }
 
         // See if the core engine can handle this intrinsic.
         if this.eval_intrinsic(instance, args, dest, ret)? {
@@ -35,7 +45,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let intrinsic_name = this.tcx.item_name(instance.def_id());
         let intrinsic_name = intrinsic_name.as_str();
 
-        match this.emulate_intrinsic_by_name(intrinsic_name, instance.args, args, dest, ret)? {
+        // FIXME: avoid allocating memory
+        let dest = this.force_allocation(dest)?;
+
+        match this.emulate_intrinsic_by_name(intrinsic_name, instance.args, args, &dest, ret)? {
             EmulateItemResult::NotSupported => {
                 // We haven't handled the intrinsic, let's see if we can use a fallback body.
                 if this.tcx.intrinsic(instance.def_id()).unwrap().must_be_overridden {
@@ -84,7 +97,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
 
         if let Some(name) = intrinsic_name.strip_prefix("atomic_") {
-            return this.emulate_atomic_intrinsic(name, args, dest);
+            return this.emulate_atomic_intrinsic(name, generic_args, args, dest);
         }
         if let Some(name) = intrinsic_name.strip_prefix("simd_") {
             return this.emulate_simd_intrinsic(name, generic_args, args, dest);

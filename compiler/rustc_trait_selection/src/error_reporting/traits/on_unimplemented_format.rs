@@ -1,11 +1,12 @@
 use std::fmt;
+use std::ops::Range;
 
 use errors::*;
-use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::print::TraitRefPrintSugared;
+use rustc_middle::ty::{GenericParamDefKind, TyCtxt};
 use rustc_parse_format::{
-    Alignment, Argument, Count, FormatSpec, InnerSpan, ParseError, ParseMode, Parser,
-    Piece as RpfPiece, Position,
+    Alignment, Argument, Count, FormatSpec, ParseError, ParseMode, Parser, Piece as RpfPiece,
+    Position,
 };
 use rustc_session::lint::builtin::UNKNOWN_OR_MALFORMED_DIAGNOSTIC_ATTRIBUTES;
 use rustc_span::def_id::DefId;
@@ -19,7 +20,7 @@ pub struct FormatString {
     input: Symbol,
     span: Span,
     pieces: Vec<Piece>,
-    /// The formatting string was parsed succesfully but with warnings
+    /// The formatting string was parsed successfully but with warnings
     pub warnings: Vec<FormatWarning>,
 }
 
@@ -173,7 +174,7 @@ impl FormatString {
                     pieces.push(Piece::Lit(lit.into()));
                 }
                 RpfPiece::NextArgument(arg) => {
-                    warn_on_format_spec(arg.format, &mut warnings, span);
+                    warn_on_format_spec(arg.format.clone(), &mut warnings, span);
                     let arg = parse_arg(&arg, ctx, &mut warnings, span);
                     pieces.push(Piece::Arg(arg));
                 }
@@ -231,48 +232,16 @@ fn parse_arg<'tcx>(
 ) -> FormatArg {
     let (Ctx::RustcOnUnimplemented { tcx, trait_def_id }
     | Ctx::DiagnosticOnUnimplemented { tcx, trait_def_id }) = ctx;
-    let trait_name = tcx.item_ident(*trait_def_id);
-    let generics = tcx.generics_of(trait_def_id);
-    let span = slice_span(input_span, arg.position_span);
+
+    let span = slice_span(input_span, arg.position_span.clone());
 
     match arg.position {
         // Something like "hello {name}"
         Position::ArgumentNamed(name) => match (ctx, Symbol::intern(name)) {
-            // accepted, but deprecated
-            (Ctx::RustcOnUnimplemented { .. }, sym::_Self) => {
-                warnings
-                    .push(FormatWarning::FutureIncompat { span, help: String::from("use {Self}") });
-                FormatArg::SelfUpper
-            }
-            (
-                Ctx::RustcOnUnimplemented { .. },
-                sym::from_desugaring
-                | sym::crate_local
-                | sym::direct
-                | sym::cause
-                | sym::float
-                | sym::integer_
-                | sym::integral,
-            ) => {
-                warnings.push(FormatWarning::FutureIncompat {
-                    span,
-                    help: String::from("don't use this in a format string"),
-                });
-                FormatArg::AsIs(String::new())
-            }
-
             // Only `#[rustc_on_unimplemented]` can use these
             (Ctx::RustcOnUnimplemented { .. }, sym::ItemContext) => FormatArg::ItemContext,
             (Ctx::RustcOnUnimplemented { .. }, sym::This) => FormatArg::This,
             (Ctx::RustcOnUnimplemented { .. }, sym::Trait) => FormatArg::Trait,
-            // `{ThisTraitsName}`. Some attrs in std use this, but I'd like to change it to the more general `{This}`
-            // because that'll be simpler to parse and extend in the future
-            (Ctx::RustcOnUnimplemented { .. }, name) if name == trait_name.name => {
-                warnings
-                    .push(FormatWarning::FutureIncompat { span, help: String::from("use {This}") });
-                FormatArg::This
-            }
-
             // Any attribute can use these
             (
                 Ctx::RustcOnUnimplemented { .. } | Ctx::DiagnosticOnUnimplemented { .. },
@@ -281,7 +250,10 @@ fn parse_arg<'tcx>(
             (
                 Ctx::RustcOnUnimplemented { .. } | Ctx::DiagnosticOnUnimplemented { .. },
                 generic_param,
-            ) if generics.own_params.iter().any(|param| param.name == generic_param) => {
+            ) if tcx.generics_of(trait_def_id).own_params.iter().any(|param| {
+                !matches!(param.kind, GenericParamDefKind::Lifetime) && param.name == generic_param
+            }) =>
+            {
                 FormatArg::GenericParam { generic_param }
             }
 
@@ -335,14 +307,12 @@ fn warn_on_format_spec(spec: FormatSpec<'_>, warnings: &mut Vec<FormatWarning>, 
     }
 }
 
-/// Helper function because `Span` and `rustc_parse_format::InnerSpan` don't know about each other
-fn slice_span(input: Span, inner: InnerSpan) -> Span {
-    let InnerSpan { start, end } = inner;
+fn slice_span(input: Span, range: Range<usize>) -> Span {
     let span = input.data();
 
     Span::new(
-        span.lo + BytePos::from_usize(start),
-        span.lo + BytePos::from_usize(end),
+        span.lo + BytePos::from_usize(range.start),
+        span.lo + BytePos::from_usize(range.end),
         span.ctxt,
         span.parent,
     )
@@ -376,39 +346,4 @@ pub mod errors {
     #[diag(trait_selection_missing_options_for_on_unimplemented_attr)]
     #[help]
     pub struct MissingOptionsForOnUnimplementedAttr;
-
-    #[derive(LintDiagnostic)]
-    #[diag(trait_selection_ignored_diagnostic_option)]
-    pub struct IgnoredDiagnosticOption {
-        pub option_name: &'static str,
-        #[label]
-        pub span: Span,
-        #[label(trait_selection_other_label)]
-        pub prev_span: Span,
-    }
-
-    impl IgnoredDiagnosticOption {
-        pub fn maybe_emit_warning<'tcx>(
-            tcx: TyCtxt<'tcx>,
-            item_def_id: DefId,
-            new: Option<Span>,
-            old: Option<Span>,
-            option_name: &'static str,
-        ) {
-            if let (Some(new_item), Some(old_item)) = (new, old) {
-                if let Some(item_def_id) = item_def_id.as_local() {
-                    tcx.emit_node_span_lint(
-                        UNKNOWN_OR_MALFORMED_DIAGNOSTIC_ATTRIBUTES,
-                        tcx.local_def_id_to_hir_id(item_def_id),
-                        new_item,
-                        IgnoredDiagnosticOption {
-                            span: new_item,
-                            prev_span: old_item,
-                            option_name,
-                        },
-                    );
-                }
-            }
-        }
-    }
 }
