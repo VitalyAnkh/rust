@@ -165,6 +165,8 @@ pub struct MiriConfig {
     pub address_reuse_cross_thread_rate: f64,
     /// Round Robin scheduling with no preemption.
     pub fixed_scheduling: bool,
+    /// Always prefer the intrinsic fallback body over the native Miri implementation.
+    pub force_intrinsic_fallback: bool,
 }
 
 impl Default for MiriConfig {
@@ -203,6 +205,7 @@ impl Default for MiriConfig {
             address_reuse_rate: 0.5,
             address_reuse_cross_thread_rate: 0.1,
             fixed_scheduling: false,
+            force_intrinsic_fallback: false,
         }
     }
 }
@@ -351,14 +354,13 @@ pub fn create_ecx<'tcx>(
             argvs.push(arg_place.to_ref(&ecx));
         }
         // Make an array with all these pointers, in the Miri memory.
-        let argvs_layout = ecx.layout_of(Ty::new_array(
-            tcx,
-            Ty::new_imm_ptr(tcx, tcx.types.u8),
-            u64::try_from(argvs.len()).unwrap(),
-        ))?;
+        let u8_ptr_type = Ty::new_imm_ptr(tcx, tcx.types.u8);
+        let u8_ptr_ptr_type = Ty::new_imm_ptr(tcx, u8_ptr_type);
+        let argvs_layout =
+            ecx.layout_of(Ty::new_array(tcx, u8_ptr_type, u64::try_from(argvs.len()).unwrap()))?;
         let argvs_place = ecx.allocate(argvs_layout, MiriMemoryKind::Machine.into())?;
-        for (idx, arg) in argvs.into_iter().enumerate() {
-            let place = ecx.project_field(&argvs_place, idx)?;
+        for (arg, idx) in argvs.into_iter().zip(0..) {
+            let place = ecx.project_index(&argvs_place, idx)?;
             ecx.write_immediate(arg, &place)?;
         }
         ecx.mark_immutable(&argvs_place);
@@ -370,10 +372,8 @@ pub fn create_ecx<'tcx>(
             ecx.mark_immutable(&argc_place);
             ecx.machine.argc = Some(argc_place.ptr());
 
-            let argv_place = ecx.allocate(
-                ecx.layout_of(Ty::new_imm_ptr(tcx, tcx.types.unit))?,
-                MiriMemoryKind::Machine.into(),
-            )?;
+            let argv_place =
+                ecx.allocate(ecx.layout_of(u8_ptr_ptr_type)?, MiriMemoryKind::Machine.into())?;
             ecx.write_pointer(argvs_place.ptr(), &argv_place)?;
             ecx.mark_immutable(&argv_place);
             ecx.machine.argv = Some(argv_place.ptr());
@@ -389,13 +389,15 @@ pub fn create_ecx<'tcx>(
                 ecx.allocate(ecx.layout_of(cmd_type)?, MiriMemoryKind::Machine.into())?;
             ecx.machine.cmd_line = Some(cmd_place.ptr());
             // Store the UTF-16 string. We just allocated so we know the bounds are fine.
-            for (idx, &c) in cmd_utf16.iter().enumerate() {
-                let place = ecx.project_field(&cmd_place, idx)?;
+            for (&c, idx) in cmd_utf16.iter().zip(0..) {
+                let place = ecx.project_index(&cmd_place, idx)?;
                 ecx.write_scalar(Scalar::from_u16(c), &place)?;
             }
             ecx.mark_immutable(&cmd_place);
         }
-        ecx.mplace_to_ref(&argvs_place)?
+        let imm = argvs_place.to_ref(&ecx);
+        let layout = ecx.layout_of(u8_ptr_ptr_type)?;
+        ImmTy::from_immediate(imm, layout)
     };
 
     // Return place (in static memory so that it does not count as leak).

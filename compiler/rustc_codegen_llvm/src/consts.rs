@@ -411,7 +411,7 @@ impl<'ll> CodegenCx<'ll, '_> {
         g
     }
 
-    fn codegen_static_item(&self, def_id: DefId) {
+    fn codegen_static_item(&mut self, def_id: DefId) {
         unsafe {
             assert!(
                 llvm::LLVMGetInitializer(
@@ -527,7 +527,7 @@ impl<'ll> CodegenCx<'ll, '_> {
 
             base::set_variable_sanitizer_attrs(g, attrs);
 
-            if attrs.flags.contains(CodegenFnAttrFlags::USED) {
+            if attrs.flags.contains(CodegenFnAttrFlags::USED_COMPILER) {
                 // `USED` and `USED_LINKER` can't be used together.
                 assert!(!attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER));
 
@@ -541,21 +541,32 @@ impl<'ll> CodegenCx<'ll, '_> {
                 // in the handling of `.init_array` (the static constructor list) in versions of
                 // the gold linker (prior to the one released with binutils 2.36).
                 //
-                // That said, we only ever emit these when compiling for ELF targets, unless
-                // `#[used(compiler)]` is explicitly requested. This is to avoid similar breakage
-                // on other targets, in particular MachO targets have *their* static constructor
-                // lists broken if `llvm.compiler.used` is emitted rather than `llvm.used`. However,
-                // that check happens when assigning the `CodegenFnAttrFlags` in
-                // `rustc_hir_analysis`, so we don't need to take care of it here.
+                // That said, we only ever emit these when `#[used(compiler)]` is explicitly
+                // requested. This is to avoid similar breakage on other targets, in particular
+                // MachO targets have *their* static constructor lists broken if `llvm.compiler.used`
+                // is emitted rather than `llvm.used`. However, that check happens when assigning
+                // the `CodegenFnAttrFlags` in the `codegen_fn_attrs` query, so we don't need to
+                // take care of it here.
                 self.add_compiler_used_global(g);
             }
             if attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER) {
                 // `USED` and `USED_LINKER` can't be used together.
-                assert!(!attrs.flags.contains(CodegenFnAttrFlags::USED));
+                assert!(!attrs.flags.contains(CodegenFnAttrFlags::USED_COMPILER));
 
                 self.add_used_global(g);
             }
         }
+    }
+
+    /// Add a global value to a list to be stored in the `llvm.used` variable, an array of ptr.
+    pub(crate) fn add_used_global(&mut self, global: &'ll Value) {
+        self.used_statics.push(global);
+    }
+
+    /// Add a global value to a list to be stored in the `llvm.compiler.used` variable,
+    /// an array of ptr.
+    pub(crate) fn add_compiler_used_global(&mut self, global: &'ll Value) {
+        self.compiler_used_statics.push(global);
     }
 }
 
@@ -571,18 +582,7 @@ impl<'ll> StaticCodegenMethods for CodegenCx<'ll, '_> {
         self.const_pointercast(gv, self.type_ptr())
     }
 
-    fn codegen_static(&self, def_id: DefId) {
+    fn codegen_static(&mut self, def_id: DefId) {
         self.codegen_static_item(def_id)
-    }
-
-    /// Add a global value to a list to be stored in the `llvm.used` variable, an array of ptr.
-    fn add_used_global(&self, global: &'ll Value) {
-        self.used_statics.borrow_mut().push(global);
-    }
-
-    /// Add a global value to a list to be stored in the `llvm.compiler.used` variable,
-    /// an array of ptr.
-    fn add_compiler_used_global(&self, global: &'ll Value) {
-        self.compiler_used_statics.borrow_mut().push(global);
     }
 }
