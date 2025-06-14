@@ -24,7 +24,8 @@ use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 use rustc_span::edition::{DEFAULT_EDITION, EDITION_NAME_LIST, Edition, LATEST_STABLE_EDITION};
 use rustc_span::source_map::FilePathMapping;
 use rustc_span::{
-    FileName, FileNameDisplayPreference, RealFileName, SourceFileHashAlgorithm, Symbol, sym,
+    FileName, FileNameDisplayPreference, FileNameEmbeddablePreference, RealFileName,
+    SourceFileHashAlgorithm, Symbol, sym,
 };
 use rustc_target::spec::{
     FramePointer, LinkSelfContainedComponents, LinkerFeatures, SplitDebuginfo, Target, TargetTuple,
@@ -1319,6 +1320,11 @@ fn file_path_mapping(
             FileNameDisplayPreference::Remapped
         } else {
             FileNameDisplayPreference::Local
+        },
+        if unstable_opts.remap_path_scope.is_all() {
+            FileNameEmbeddablePreference::RemappedOnly
+        } else {
+            FileNameEmbeddablePreference::LocalAndRemapped
         },
     )
 }
@@ -2642,6 +2648,15 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
     }
 
     let prints = collect_print_requests(early_dcx, &mut cg, &unstable_opts, matches);
+
+    // -Zretpoline-external-thunk also requires -Zretpoline
+    if unstable_opts.retpoline_external_thunk {
+        unstable_opts.retpoline = true;
+        target_modifiers.insert(
+            OptionsTargetModifiers::UnstableOptions(UnstableOptionsTargetModifiers::retpoline),
+            "true".to_string(),
+        );
+    }
 
     let cg = cg;
 
