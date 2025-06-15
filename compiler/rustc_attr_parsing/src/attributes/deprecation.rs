@@ -1,28 +1,24 @@
 use rustc_attr_data_structures::{AttributeKind, DeprecatedSince, Deprecation};
-use rustc_span::symbol::Ident;
 use rustc_span::{Span, Symbol, sym};
 
-use super::SingleAttributeParser;
 use super::util::parse_version;
-use crate::context::AcceptContext;
+use super::{AttributeOrder, OnDuplicate, SingleAttributeParser};
+use crate::context::{AcceptContext, Stage};
 use crate::parser::ArgParser;
 use crate::session_diagnostics;
 use crate::session_diagnostics::UnsupportedLiteralReason;
 
 pub(crate) struct DeprecationParser;
 
-fn get(
-    cx: &AcceptContext<'_>,
-    ident: Ident,
+fn get<S: Stage>(
+    cx: &AcceptContext<'_, '_, S>,
+    name: Symbol,
     param_span: Span,
     arg: &ArgParser<'_>,
     item: &Option<Symbol>,
 ) -> Option<Symbol> {
     if item.is_some() {
-        cx.emit_err(session_diagnostics::MultipleItem {
-            span: param_span,
-            item: ident.to_string(),
-        });
+        cx.emit_err(session_diagnostics::MultipleItem { span: param_span, item: name.to_string() });
         return None;
     }
     if let Some(v) = arg.name_value() {
@@ -45,19 +41,12 @@ fn get(
     }
 }
 
-impl SingleAttributeParser for DeprecationParser {
-    const PATH: &'static [rustc_span::Symbol] = &[sym::deprecated];
+impl<S: Stage> SingleAttributeParser<S> for DeprecationParser {
+    const PATH: &[Symbol] = &[sym::deprecated];
+    const ATTRIBUTE_ORDER: AttributeOrder = AttributeOrder::KeepFirst;
+    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
 
-    fn on_duplicate(cx: &AcceptContext<'_>, first_span: rustc_span::Span) {
-        // FIXME(jdonszelmann): merge with errors from check_attrs.rs
-        cx.emit_err(session_diagnostics::UnusedMultiple {
-            this: cx.attr_span,
-            other: first_span,
-            name: sym::deprecated,
-        });
-    }
-
-    fn convert(cx: &AcceptContext<'_>, args: &ArgParser<'_>) -> Option<AttributeKind> {
+    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser<'_>) -> Option<AttributeKind> {
         let features = cx.features();
 
         let mut since = None;
@@ -83,16 +72,16 @@ impl SingleAttributeParser for DeprecationParser {
                     return None;
                 };
 
-                let (ident, arg) = param.word_or_empty();
+                let ident_name = param.path().word_sym();
 
-                match ident.name {
-                    sym::since => {
-                        since = Some(get(cx, ident, param_span, arg, &since)?);
+                match ident_name {
+                    Some(name @ sym::since) => {
+                        since = Some(get(cx, name, param_span, param.args(), &since)?);
                     }
-                    sym::note => {
-                        note = Some(get(cx, ident, param_span, arg, &note)?);
+                    Some(name @ sym::note) => {
+                        note = Some(get(cx, name, param_span, param.args(), &note)?);
                     }
-                    sym::suggestion => {
+                    Some(name @ sym::suggestion) => {
                         if !features.deprecated_suggestion() {
                             cx.emit_err(session_diagnostics::DeprecatedItemSuggestion {
                                 span: param_span,
@@ -101,12 +90,12 @@ impl SingleAttributeParser for DeprecationParser {
                             });
                         }
 
-                        suggestion = Some(get(cx, ident, param_span, arg, &suggestion)?);
+                        suggestion = Some(get(cx, name, param_span, param.args(), &suggestion)?);
                     }
                     _ => {
                         cx.emit_err(session_diagnostics::UnknownMetaItem {
                             span: param_span,
-                            item: ident.to_string(),
+                            item: param.path().to_string(),
                             expected: if features.deprecated_suggestion() {
                                 &["since", "note", "suggestion"]
                             } else {
