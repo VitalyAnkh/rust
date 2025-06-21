@@ -10,7 +10,6 @@
 #![allow(internal_features)]
 #![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::untranslatable_diagnostic)]
-#![cfg_attr(bootstrap, feature(let_chains))]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
 #![feature(assert_matches)]
@@ -1140,7 +1139,7 @@ pub struct Resolver<'ra, 'tcx> {
     proc_macro_stubs: FxHashSet<LocalDefId>,
     /// Traces collected during macro resolution and validated when it's complete.
     single_segment_macro_resolutions:
-        Vec<(Ident, MacroKind, ParentScope<'ra>, Option<NameBinding<'ra>>)>,
+        Vec<(Ident, MacroKind, ParentScope<'ra>, Option<NameBinding<'ra>>, Option<Span>)>,
     multi_segment_macro_resolutions:
         Vec<(Vec<Segment>, Span, MacroKind, ParentScope<'ra>, Option<Res>, Namespace)>,
     builtin_attrs: Vec<(Ident, ParentScope<'ra>)>,
@@ -1935,12 +1934,26 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         }
         if let NameBindingKind::Import { import, binding } = used_binding.kind {
             if let ImportKind::MacroUse { warn_private: true } = import.kind {
-                self.lint_buffer().buffer_lint(
-                    PRIVATE_MACRO_USE,
-                    import.root_id,
-                    ident.span,
-                    BuiltinLintDiag::MacroIsPrivate(ident),
-                );
+                // Do not report the lint if the macro name resolves in stdlib prelude
+                // even without the problematic `macro_use` import.
+                let found_in_stdlib_prelude = self.prelude.is_some_and(|prelude| {
+                    self.maybe_resolve_ident_in_module(
+                        ModuleOrUniformRoot::Module(prelude),
+                        ident,
+                        MacroNS,
+                        &ParentScope::module(self.empty_module, self),
+                        None,
+                    )
+                    .is_ok()
+                });
+                if !found_in_stdlib_prelude {
+                    self.lint_buffer().buffer_lint(
+                        PRIVATE_MACRO_USE,
+                        import.root_id,
+                        ident.span,
+                        BuiltinLintDiag::MacroIsPrivate(ident),
+                    );
+                }
             }
             // Avoid marking `extern crate` items that refer to a name from extern prelude,
             // but not introduce it, as used if they are accessed from lexical scope.
@@ -2157,13 +2170,24 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         ns: Namespace,
         parent_scope: ParentScope<'ra>,
     ) -> Option<Res> {
-        let mut segments =
-            Vec::from_iter(path_str.split("::").map(Ident::from_str).map(Segment::from_ident));
-        if let Some(segment) = segments.first_mut() {
-            if segment.ident.name == kw::Empty {
-                segment.ident.name = kw::PathRoot;
-            }
-        }
+        let segments: Result<Vec<_>, ()> = path_str
+            .split("::")
+            .enumerate()
+            .map(|(i, s)| {
+                let sym = if s.is_empty() {
+                    if i == 0 {
+                        // For a path like `::a::b`, use `kw::PathRoot` as the leading segment.
+                        kw::PathRoot
+                    } else {
+                        return Err(()); // occurs in cases like `String::`
+                    }
+                } else {
+                    Symbol::intern(s)
+                };
+                Ok(Segment::from_ident(Ident::with_dummy_span(sym)))
+            })
+            .collect();
+        let Ok(segments) = segments else { return None };
 
         match self.maybe_resolve_path(&segments, Some(ns), &parent_scope, None) {
             PathResult::Module(ModuleOrUniformRoot::Module(module)) => Some(module.res().unwrap()),

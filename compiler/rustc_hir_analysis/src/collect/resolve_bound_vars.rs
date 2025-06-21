@@ -14,7 +14,7 @@ use rustc_ast::visit::walk_list;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::definitions::DisambiguatorState;
+use rustc_hir::definitions::{DefPathData, DisambiguatorState};
 use rustc_hir::intravisit::{self, InferKind, Visitor, VisitorExt};
 use rustc_hir::{
     self as hir, AmbigArg, GenericArg, GenericParam, GenericParamKind, HirId, LifetimeKind, Node,
@@ -634,11 +634,11 @@ impl<'a, 'tcx> Visitor<'tcx> for BoundVarContext<'a, 'tcx> {
                 // These sorts of items have no lifetime parameters at all.
                 intravisit::walk_item(self, item);
             }
-            hir::ItemKind::TyAlias(_, _, generics)
-            | hir::ItemKind::Const(_, _, generics, _)
-            | hir::ItemKind::Enum(_, _, generics)
-            | hir::ItemKind::Struct(_, _, generics)
-            | hir::ItemKind::Union(_, _, generics)
+            hir::ItemKind::TyAlias(_, generics, _)
+            | hir::ItemKind::Const(_, generics, _, _)
+            | hir::ItemKind::Enum(_, generics, _)
+            | hir::ItemKind::Struct(_, generics, _)
+            | hir::ItemKind::Union(_, generics, _)
             | hir::ItemKind::Trait(_, _, _, generics, ..)
             | hir::ItemKind::TraitAlias(_, generics, ..)
             | hir::ItemKind::Impl(&hir::Impl { generics, .. }) => {
@@ -1470,14 +1470,14 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
             let mut captures = captures.borrow_mut();
             let remapped = *captures.entry(lifetime).or_insert_with(|| {
                 // `opaque_def_id` is unique to the `BoundVarContext` pass which is executed once
-                // per `resolve_bound_vars` query. This is the only location that creates nested
-                // lifetime inside a opaque type. `<opaque_def_id>::LifetimeNs(..)` is thus unique
+                // per `resolve_bound_vars` query. This is the only location that creates
+                // `OpaqueLifetime` paths. `<opaque_def_id>::OpaqueLifetime(..)` is thus unique
                 // to this query and duplicates within the query are handled by `self.disambiguator`.
                 let feed = self.tcx.create_def(
                     opaque_def_id,
-                    Some(ident.name),
-                    DefKind::LifetimeParam,
                     None,
+                    DefKind::LifetimeParam,
+                    Some(DefPathData::OpaqueLifetime(ident.name)),
                     &mut self.disambiguator,
                 );
                 feed.def_span(ident.span);
@@ -2177,84 +2177,80 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
     /// Walk the generics of the item for a trait bound whose self type
     /// corresponds to the expected res, and return the trait def id.
     fn for_each_trait_bound_on_res(&self, expected_res: Res) -> impl Iterator<Item = DefId> {
-        std::iter::from_coroutine(
-            #[coroutine]
-            move || {
-                let mut scope = self.scope;
-                loop {
-                    let hir_id = match *scope {
-                        Scope::Binder { hir_id, .. } => Some(hir_id),
-                        Scope::Root { opt_parent_item: Some(parent_def_id) } => {
-                            Some(self.tcx.local_def_id_to_hir_id(parent_def_id))
-                        }
-                        Scope::Body { .. }
-                        | Scope::ObjectLifetimeDefault { .. }
-                        | Scope::Supertrait { .. }
-                        | Scope::TraitRefBoundary { .. }
-                        | Scope::LateBoundary { .. }
-                        | Scope::Opaque { .. }
-                        | Scope::Root { opt_parent_item: None } => None,
-                    };
+        gen move {
+            let mut scope = self.scope;
+            loop {
+                let hir_id = match *scope {
+                    Scope::Binder { hir_id, .. } => Some(hir_id),
+                    Scope::Root { opt_parent_item: Some(parent_def_id) } => {
+                        Some(self.tcx.local_def_id_to_hir_id(parent_def_id))
+                    }
+                    Scope::Body { .. }
+                    | Scope::ObjectLifetimeDefault { .. }
+                    | Scope::Supertrait { .. }
+                    | Scope::TraitRefBoundary { .. }
+                    | Scope::LateBoundary { .. }
+                    | Scope::Opaque { .. }
+                    | Scope::Root { opt_parent_item: None } => None,
+                };
 
-                    if let Some(hir_id) = hir_id {
-                        let node = self.tcx.hir_node(hir_id);
-                        // If this is a `Self` bound in a trait, yield the trait itself.
-                        // Specifically, we don't need to look at any supertraits since
-                        // we already do that in `BoundVarContext::supertrait_hrtb_vars`.
-                        if let Res::SelfTyParam { trait_: _ } = expected_res
-                            && let hir::Node::Item(item) = node
-                            && let hir::ItemKind::Trait(..) = item.kind
-                        {
-                            // Yield the trait's def id. Supertraits will be
-                            // elaborated from that.
-                            yield item.owner_id.def_id.to_def_id();
-                        } else if let Some(generics) = node.generics() {
-                            for pred in generics.predicates {
-                                let hir::WherePredicateKind::BoundPredicate(pred) = pred.kind
-                                else {
-                                    continue;
-                                };
-                                let hir::TyKind::Path(hir::QPath::Resolved(None, bounded_path)) =
-                                    pred.bounded_ty.kind
-                                else {
-                                    continue;
-                                };
-                                // Match the expected res.
-                                if bounded_path.res != expected_res {
-                                    continue;
-                                }
-                                for pred in pred.bounds {
-                                    match pred {
-                                        hir::GenericBound::Trait(poly_trait_ref) => {
-                                            if let Some(def_id) =
-                                                poly_trait_ref.trait_ref.trait_def_id()
-                                            {
-                                                yield def_id;
-                                            }
+                if let Some(hir_id) = hir_id {
+                    let node = self.tcx.hir_node(hir_id);
+                    // If this is a `Self` bound in a trait, yield the trait itself.
+                    // Specifically, we don't need to look at any supertraits since
+                    // we already do that in `BoundVarContext::supertrait_hrtb_vars`.
+                    if let Res::SelfTyParam { trait_: _ } = expected_res
+                        && let hir::Node::Item(item) = node
+                        && let hir::ItemKind::Trait(..) = item.kind
+                    {
+                        // Yield the trait's def id. Supertraits will be
+                        // elaborated from that.
+                        yield item.owner_id.def_id.to_def_id();
+                    } else if let Some(generics) = node.generics() {
+                        for pred in generics.predicates {
+                            let hir::WherePredicateKind::BoundPredicate(pred) = pred.kind else {
+                                continue;
+                            };
+                            let hir::TyKind::Path(hir::QPath::Resolved(None, bounded_path)) =
+                                pred.bounded_ty.kind
+                            else {
+                                continue;
+                            };
+                            // Match the expected res.
+                            if bounded_path.res != expected_res {
+                                continue;
+                            }
+                            for pred in pred.bounds {
+                                match pred {
+                                    hir::GenericBound::Trait(poly_trait_ref) => {
+                                        if let Some(def_id) =
+                                            poly_trait_ref.trait_ref.trait_def_id()
+                                        {
+                                            yield def_id;
                                         }
-                                        hir::GenericBound::Outlives(_)
-                                        | hir::GenericBound::Use(_, _) => {}
                                     }
+                                    hir::GenericBound::Outlives(_)
+                                    | hir::GenericBound::Use(_, _) => {}
                                 }
                             }
                         }
                     }
-
-                    match *scope {
-                        Scope::Binder { s, .. }
-                        | Scope::Body { s, .. }
-                        | Scope::ObjectLifetimeDefault { s, .. }
-                        | Scope::Supertrait { s, .. }
-                        | Scope::TraitRefBoundary { s }
-                        | Scope::LateBoundary { s, .. }
-                        | Scope::Opaque { s, .. } => {
-                            scope = s;
-                        }
-                        Scope::Root { .. } => break,
-                    }
                 }
-            },
-        )
+
+                match *scope {
+                    Scope::Binder { s, .. }
+                    | Scope::Body { s, .. }
+                    | Scope::ObjectLifetimeDefault { s, .. }
+                    | Scope::Supertrait { s, .. }
+                    | Scope::TraitRefBoundary { s }
+                    | Scope::LateBoundary { s, .. }
+                    | Scope::Opaque { s, .. } => {
+                        scope = s;
+                    }
+                    Scope::Root { .. } => break,
+                }
+            }
+        }
     }
 }
 

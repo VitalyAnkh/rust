@@ -4,6 +4,7 @@ use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContex
 use rustc_type_ir_macros::{TypeFoldable_Generic, TypeVisitable_Generic};
 
 use crate::fold::TypeFoldable;
+use crate::inherent::*;
 use crate::relate::RelateResult;
 use crate::relate::combine::PredicateEmittingRelation;
 use crate::{self as ty, Interner};
@@ -100,7 +101,7 @@ impl<I: Interner> TypingMode<I> {
     pub fn typeck_for_body(cx: I, body_def_id: I::LocalDefId) -> TypingMode<I> {
         TypingMode::Analysis {
             defining_opaque_types_and_generators: cx
-                .opaque_types_and_generators_defined_by(body_def_id),
+                .opaque_types_and_coroutines_defined_by(body_def_id),
         }
     }
 
@@ -165,6 +166,8 @@ pub trait InferCtxtLike: Sized {
         &self,
         vid: ty::RegionVid,
     ) -> <Self::Interner as Interner>::Region;
+
+    fn is_changed_arg(&self, arg: <Self::Interner as Interner>::GenericArg) -> bool;
 
     fn next_region_infer(&self) -> <Self::Interner as Interner>::Region;
     fn next_ty_infer(&self) -> <Self::Interner as Interner>::Ty;
@@ -245,4 +248,32 @@ pub trait InferCtxtLike: Sized {
         r: <Self::Interner as Interner>::Region,
         span: <Self::Interner as Interner>::Span,
     );
+
+    type OpaqueTypeStorageEntries: OpaqueTypeStorageEntries;
+    fn opaque_types_storage_num_entries(&self) -> Self::OpaqueTypeStorageEntries;
+    fn clone_opaque_types_lookup_table(
+        &self,
+    ) -> Vec<(ty::OpaqueTypeKey<Self::Interner>, <Self::Interner as Interner>::Ty)>;
+    fn clone_duplicate_opaque_types(
+        &self,
+    ) -> Vec<(ty::OpaqueTypeKey<Self::Interner>, <Self::Interner as Interner>::Ty)>;
+    fn clone_opaque_types_added_since(
+        &self,
+        prev_entries: Self::OpaqueTypeStorageEntries,
+    ) -> Vec<(ty::OpaqueTypeKey<Self::Interner>, <Self::Interner as Interner>::Ty)>;
+
+    fn register_hidden_type_in_storage(
+        &self,
+        opaque_type_key: ty::OpaqueTypeKey<Self::Interner>,
+        hidden_ty: <Self::Interner as Interner>::Ty,
+        span: <Self::Interner as Interner>::Span,
+    ) -> Option<<Self::Interner as Interner>::Ty>;
+    fn add_duplicate_opaque_type(
+        &self,
+        opaque_type_key: ty::OpaqueTypeKey<Self::Interner>,
+        hidden_ty: <Self::Interner as Interner>::Ty,
+        span: <Self::Interner as Interner>::Span,
+    );
+
+    fn reset_opaque_types(&self);
 }

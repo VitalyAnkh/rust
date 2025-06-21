@@ -14,16 +14,17 @@ use rustc_type_ir::{
     TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
     TypingMode,
 };
-use tracing::{instrument, trace};
+use tracing::{debug, instrument, trace};
 
 use super::has_only_region_constraints;
 use crate::coherence;
 use crate::delegate::SolverDelegate;
+use crate::placeholder::BoundVarReplacer;
 use crate::solve::inspect::{self, ProofTreeBuilder};
 use crate::solve::search_graph::SearchGraph;
 use crate::solve::{
-    CanonicalInput, Certainty, FIXPOINT_STEP_LIMIT, Goal, GoalEvaluationKind, GoalSource,
-    HasChanged, NestedNormalizationGoals, NoSolution, PredefinedOpaquesData, QueryInput,
+    CanonicalInput, Certainty, FIXPOINT_STEP_LIMIT, Goal, GoalEvaluation, GoalEvaluationKind,
+    GoalSource, GoalStalledOn, HasChanged, NestedNormalizationGoals, NoSolution, QueryInput,
     QueryResult,
 };
 
@@ -92,14 +93,12 @@ where
 
     /// The variable info for the `var_values`, only used to make an ambiguous response
     /// with no constraints.
-    variables: I::CanonicalVars,
+    variables: I::CanonicalVarKinds,
 
     /// What kind of goal we're currently computing, see the enum definition
     /// for more info.
     current_goal_kind: CurrentGoalKind,
     pub(super) var_values: CanonicalVarValues<I>,
-
-    predefined_opaques_in_body: I::PredefinedOpaques,
 
     /// The highest universe index nameable by the caller.
     ///
@@ -111,10 +110,14 @@ where
     /// if we have a coinductive cycle and because that's the only way we can return
     /// new placeholders to the caller.
     pub(super) max_input_universe: ty::UniverseIndex,
+    /// The opaque types from the canonical input. We only need to return opaque types
+    /// which have been added to the storage while evaluating this goal.
+    pub(super) initial_opaque_types_storage_num_entries:
+        <D::Infcx as InferCtxtLike>::OpaqueTypeStorageEntries,
 
     pub(super) search_graph: &'a mut SearchGraph<D>,
 
-    nested_goals: Vec<(GoalSource, Goal<I, I::Predicate>)>,
+    nested_goals: Vec<(GoalSource, Goal<I, I::Predicate>, Option<GoalStalledOn<I>>)>,
 
     pub(super) origin_span: I::Span,
 
@@ -146,8 +149,9 @@ pub trait SolverDelegateEvalExt: SolverDelegate {
         goal: Goal<Self::Interner, <Self::Interner as Interner>::Predicate>,
         generate_proof_tree: GenerateProofTree,
         span: <Self::Interner as Interner>::Span,
+        stalled_on: Option<GoalStalledOn<Self::Interner>>,
     ) -> (
-        Result<(HasChanged, Certainty), NoSolution>,
+        Result<GoalEvaluation<Self::Interner>, NoSolution>,
         Option<inspect::GoalEvaluation<Self::Interner>>,
     );
 
@@ -170,8 +174,12 @@ pub trait SolverDelegateEvalExt: SolverDelegate {
         &self,
         goal: Goal<Self::Interner, <Self::Interner as Interner>::Predicate>,
         generate_proof_tree: GenerateProofTree,
+        stalled_on: Option<GoalStalledOn<Self::Interner>>,
     ) -> (
-        Result<(NestedNormalizationGoals<Self::Interner>, HasChanged, Certainty), NoSolution>,
+        Result<
+            (NestedNormalizationGoals<Self::Interner>, GoalEvaluation<Self::Interner>),
+            NoSolution,
+        >,
         Option<inspect::GoalEvaluation<Self::Interner>>,
     );
 }
@@ -187,9 +195,10 @@ where
         goal: Goal<I, I::Predicate>,
         generate_proof_tree: GenerateProofTree,
         span: I::Span,
-    ) -> (Result<(HasChanged, Certainty), NoSolution>, Option<inspect::GoalEvaluation<I>>) {
+        stalled_on: Option<GoalStalledOn<I>>,
+    ) -> (Result<GoalEvaluation<I>, NoSolution>, Option<inspect::GoalEvaluation<I>>) {
         EvalCtxt::enter_root(self, self.cx().recursion_limit(), generate_proof_tree, span, |ecx| {
-            ecx.evaluate_goal(GoalEvaluationKind::Root, GoalSource::Misc, goal)
+            ecx.evaluate_goal(GoalEvaluationKind::Root, GoalSource::Misc, goal, stalled_on)
         })
     }
 
@@ -200,7 +209,7 @@ where
     ) -> bool {
         self.probe(|| {
             EvalCtxt::enter_root(self, root_depth, GenerateProofTree::No, I::Span::dummy(), |ecx| {
-                ecx.evaluate_goal(GoalEvaluationKind::Root, GoalSource::Misc, goal)
+                ecx.evaluate_goal(GoalEvaluationKind::Root, GoalSource::Misc, goal, None)
             })
             .0
         })
@@ -212,8 +221,9 @@ where
         &self,
         goal: Goal<I, I::Predicate>,
         generate_proof_tree: GenerateProofTree,
+        stalled_on: Option<GoalStalledOn<I>>,
     ) -> (
-        Result<(NestedNormalizationGoals<I>, HasChanged, Certainty), NoSolution>,
+        Result<(NestedNormalizationGoals<I>, GoalEvaluation<I>), NoSolution>,
         Option<inspect::GoalEvaluation<I>>,
     ) {
         EvalCtxt::enter_root(
@@ -221,7 +231,9 @@ where
             self.cx().recursion_limit(),
             generate_proof_tree,
             I::Span::dummy(),
-            |ecx| ecx.evaluate_goal_raw(GoalEvaluationKind::Root, GoalSource::Misc, goal),
+            |ecx| {
+                ecx.evaluate_goal_raw(GoalEvaluationKind::Root, GoalSource::Misc, goal, stalled_on)
+            },
         )
     }
 }
@@ -305,10 +317,8 @@ where
 
             // Only relevant when canonicalizing the response,
             // which we don't do within this evaluation context.
-            predefined_opaques_in_body: delegate
-                .cx()
-                .mk_predefined_opaques_in_body(PredefinedOpaquesData::default()),
             max_input_universe: ty::UniverseIndex::ROOT,
+            initial_opaque_types_storage_num_entries: Default::default(),
             variables: Default::default(),
             var_values: CanonicalVarValues::dummy(),
             current_goal_kind: CurrentGoalKind::Misc,
@@ -342,31 +352,40 @@ where
         canonical_goal_evaluation: &mut ProofTreeBuilder<D>,
         f: impl FnOnce(&mut EvalCtxt<'_, D>, Goal<I, I::Predicate>) -> R,
     ) -> R {
-        let (ref delegate, input, var_values) =
-            SolverDelegate::build_with_canonical(cx, &canonical_input);
+        let (ref delegate, input, var_values) = D::build_with_canonical(cx, &canonical_input);
 
+        for &(key, ty) in &input.predefined_opaques_in_body.opaque_types {
+            let prev = delegate.register_hidden_type_in_storage(key, ty, I::Span::dummy());
+            // It may be possible that two entries in the opaque type storage end up
+            // with the same key after resolving contained inference variables.
+            //
+            // We could put them in the duplicate list but don't have to. The opaques we
+            // encounter here are already tracked in the caller, so there's no need to
+            // also store them here. We'd take them out when computing the query response
+            // and then discard them, as they're already present in the input.
+            //
+            // Ideally we'd drop duplicate opaque type definitions when computing
+            // the canonical input. This is more annoying to implement and may cause a
+            // perf regression, so we do it inside of the query for now.
+            if let Some(prev) = prev {
+                debug!(?key, ?ty, ?prev, "ignore duplicate in `opaque_types_storage`");
+            }
+        }
+
+        let initial_opaque_types_storage_num_entries = delegate.opaque_types_storage_num_entries();
         let mut ecx = EvalCtxt {
             delegate,
             variables: canonical_input.canonical.variables,
             var_values,
             current_goal_kind: CurrentGoalKind::from_query_input(cx, input),
-            predefined_opaques_in_body: input.predefined_opaques_in_body,
             max_input_universe: canonical_input.canonical.max_universe,
+            initial_opaque_types_storage_num_entries,
             search_graph,
             nested_goals: Default::default(),
             origin_span: I::Span::dummy(),
             tainted: Ok(()),
             inspect: canonical_goal_evaluation.new_goal_evaluation_step(var_values),
         };
-
-        for &(key, ty) in &input.predefined_opaques_in_body.opaque_types {
-            let prev = ecx.delegate.register_hidden_type_in_storage(key, ty, ecx.origin_span);
-            assert_eq!(prev, None);
-        }
-
-        if !ecx.nested_goals.is_empty() {
-            panic!("prepopulating opaque types shouldn't add goals: {:?}", ecx.nested_goals);
-        }
 
         let result = f(&mut ecx, input.goal);
         ecx.inspect.probe_final_state(ecx.delegate, ecx.max_input_universe);
@@ -439,11 +458,12 @@ where
         goal_evaluation_kind: GoalEvaluationKind,
         source: GoalSource,
         goal: Goal<I, I::Predicate>,
-    ) -> Result<(HasChanged, Certainty), NoSolution> {
-        let (normalization_nested_goals, has_changed, certainty) =
-            self.evaluate_goal_raw(goal_evaluation_kind, source, goal)?;
+        stalled_on: Option<GoalStalledOn<I>>,
+    ) -> Result<GoalEvaluation<I>, NoSolution> {
+        let (normalization_nested_goals, goal_evaluation) =
+            self.evaluate_goal_raw(goal_evaluation_kind, source, goal, stalled_on)?;
         assert!(normalization_nested_goals.is_empty());
-        Ok((has_changed, certainty))
+        Ok(goal_evaluation)
     }
 
     /// Recursively evaluates `goal`, returning the nested goals in case
@@ -458,7 +478,29 @@ where
         goal_evaluation_kind: GoalEvaluationKind,
         source: GoalSource,
         goal: Goal<I, I::Predicate>,
-    ) -> Result<(NestedNormalizationGoals<I>, HasChanged, Certainty), NoSolution> {
+        stalled_on: Option<GoalStalledOn<I>>,
+    ) -> Result<(NestedNormalizationGoals<I>, GoalEvaluation<I>), NoSolution> {
+        // If we have run this goal before, and it was stalled, check that any of the goal's
+        // args have changed. Otherwise, we don't need to re-run the goal because it'll remain
+        // stalled, since it'll canonicalize the same way and evaluation is pure.
+        if let Some(stalled_on) = stalled_on {
+            if !stalled_on.stalled_vars.iter().any(|value| self.delegate.is_changed_arg(*value))
+                && !self
+                    .delegate
+                    .opaque_types_storage_num_entries()
+                    .needs_reevaluation(stalled_on.num_opaques)
+            {
+                return Ok((
+                    NestedNormalizationGoals::empty(),
+                    GoalEvaluation {
+                        certainty: Certainty::Maybe(stalled_on.stalled_cause),
+                        has_changed: HasChanged::No,
+                        stalled_on: Some(stalled_on),
+                    },
+                ));
+            }
+        }
+
         let (orig_values, canonical_goal) = self.canonicalize_goal(goal);
         let mut goal_evaluation =
             self.inspect.new_goal_evaluation(goal, &orig_values, goal_evaluation_kind);
@@ -481,7 +523,7 @@ where
             if !has_only_region_constraints(response) { HasChanged::Yes } else { HasChanged::No };
 
         let (normalization_nested_goals, certainty) =
-            self.instantiate_and_apply_query_response(goal.param_env, orig_values, response);
+            self.instantiate_and_apply_query_response(goal.param_env, &orig_values, response);
         self.inspect.goal_evaluation(goal_evaluation);
 
         // FIXME: We previously had an assert here that checked that recomputing
@@ -494,7 +536,53 @@ where
         // Once we have decided on how to handle trait-system-refactor-initiative#75,
         // we should re-add an assert here.
 
-        Ok((normalization_nested_goals, has_changed, certainty))
+        let stalled_on = match certainty {
+            Certainty::Yes => None,
+            Certainty::Maybe(stalled_cause) => match has_changed {
+                // FIXME: We could recompute a *new* set of stalled variables by walking
+                // through the orig values, resolving, and computing the root vars of anything
+                // that is not resolved. Only when *these* have changed is it meaningful
+                // to recompute this goal.
+                HasChanged::Yes => None,
+                HasChanged::No => {
+                    let mut stalled_vars = orig_values;
+
+                    // Remove the canonicalized universal vars, since we only care about stalled existentials.
+                    stalled_vars.retain(|arg| match arg.kind() {
+                        ty::GenericArgKind::Type(ty) => matches!(ty.kind(), ty::Infer(_)),
+                        ty::GenericArgKind::Const(ct) => {
+                            matches!(ct.kind(), ty::ConstKind::Infer(_))
+                        }
+                        // Lifetimes can never stall goals.
+                        ty::GenericArgKind::Lifetime(_) => false,
+                    });
+
+                    // Remove the unconstrained RHS arg, which is expected to have changed.
+                    if let Some(normalizes_to) = goal.predicate.as_normalizes_to() {
+                        let normalizes_to = normalizes_to.skip_binder();
+                        let rhs_arg: I::GenericArg = normalizes_to.term.into();
+                        let idx = stalled_vars
+                            .iter()
+                            .rposition(|arg| *arg == rhs_arg)
+                            .expect("expected unconstrained arg");
+                        stalled_vars.swap_remove(idx);
+                    }
+
+                    Some(GoalStalledOn {
+                        num_opaques: canonical_goal
+                            .canonical
+                            .value
+                            .predefined_opaques_in_body
+                            .opaque_types
+                            .len(),
+                        stalled_vars,
+                        stalled_cause,
+                    })
+                }
+            },
+        };
+
+        Ok((normalization_nested_goals, GoalEvaluation { certainty, has_changed, stalled_on }))
     }
 
     fn compute_goal(&mut self, goal: Goal<I, I::Predicate>) -> QueryResult<I> {
@@ -594,7 +682,18 @@ where
         let cx = self.cx();
         // If this loop did not result in any progress, what's our final certainty.
         let mut unchanged_certainty = Some(Certainty::Yes);
-        for (source, goal) in mem::take(&mut self.nested_goals) {
+        for (source, goal, stalled_on) in mem::take(&mut self.nested_goals) {
+            if let Some(certainty) = self.delegate.compute_goal_fast_path(goal, self.origin_span) {
+                match certainty {
+                    Certainty::Yes => {}
+                    Certainty::Maybe(_) => {
+                        self.nested_goals.push((source, goal, None));
+                        unchanged_certainty = unchanged_certainty.map(|c| c.and(certainty));
+                    }
+                }
+                continue;
+            }
+
             // We treat normalizes-to goals specially here. In each iteration we take the
             // RHS of the projection, replace it with a fresh inference variable, and only
             // after evaluating that goal do we equate the fresh inference variable with the
@@ -614,11 +713,18 @@ where
                 let unconstrained_goal =
                     goal.with(cx, ty::NormalizesTo { alias: pred.alias, term: unconstrained_rhs });
 
-                let (NestedNormalizationGoals(nested_goals), _, certainty) =
-                    self.evaluate_goal_raw(GoalEvaluationKind::Nested, source, unconstrained_goal)?;
+                let (
+                    NestedNormalizationGoals(nested_goals),
+                    GoalEvaluation { certainty, stalled_on, has_changed: _ },
+                ) = self.evaluate_goal_raw(
+                    GoalEvaluationKind::Nested,
+                    source,
+                    unconstrained_goal,
+                    stalled_on,
+                )?;
                 // Add the nested goals from normalization to our own nested goals.
                 trace!(?nested_goals);
-                self.nested_goals.extend(nested_goals);
+                self.nested_goals.extend(nested_goals.into_iter().map(|(s, g)| (s, g, None)));
 
                 // Finally, equate the goal's RHS with the unconstrained var.
                 //
@@ -644,6 +750,8 @@ where
                 // looking at the "has changed" return from evaluate_goal,
                 // because we expect the `unconstrained_rhs` part of the predicate
                 // to have changed -- that means we actually normalized successfully!
+                // FIXME: Do we need to eagerly resolve here? Or should we check
+                // if the cache key has any changed vars?
                 let with_resolved_vars = self.resolve_vars_if_possible(goal);
                 if pred.alias != goal.predicate.as_normalizes_to().unwrap().skip_binder().alias {
                     unchanged_certainty = None;
@@ -652,13 +760,13 @@ where
                 match certainty {
                     Certainty::Yes => {}
                     Certainty::Maybe(_) => {
-                        self.nested_goals.push((source, with_resolved_vars));
-                        unchanged_certainty = unchanged_certainty.map(|c| c.unify_with(certainty));
+                        self.nested_goals.push((source, with_resolved_vars, stalled_on));
+                        unchanged_certainty = unchanged_certainty.map(|c| c.and(certainty));
                     }
                 }
             } else {
-                let (has_changed, certainty) =
-                    self.evaluate_goal(GoalEvaluationKind::Nested, source, goal)?;
+                let GoalEvaluation { certainty, has_changed, stalled_on } =
+                    self.evaluate_goal(GoalEvaluationKind::Nested, source, goal, stalled_on)?;
                 if has_changed == HasChanged::Yes {
                     unchanged_certainty = None;
                 }
@@ -666,8 +774,8 @@ where
                 match certainty {
                     Certainty::Yes => {}
                     Certainty::Maybe(_) => {
-                        self.nested_goals.push((source, goal));
-                        unchanged_certainty = unchanged_certainty.map(|c| c.unify_with(certainty));
+                        self.nested_goals.push((source, goal, stalled_on));
+                        unchanged_certainty = unchanged_certainty.map(|c| c.and(certainty));
                     }
                 }
             }
@@ -690,7 +798,7 @@ where
         goal.predicate =
             goal.predicate.fold_with(&mut ReplaceAliasWithInfer::new(self, source, goal.param_env));
         self.inspect.add_goal(self.delegate, self.max_input_universe, source, goal);
-        self.nested_goals.push((source, goal));
+        self.nested_goals.push((source, goal, None));
     }
 
     #[instrument(level = "trace", skip(self, goals))]
@@ -724,8 +832,8 @@ where
 
     /// Returns a ty infer or a const infer depending on whether `kind` is a `Ty` or `Const`.
     /// If `kind` is an integer inference variable this will still return a ty infer var.
-    pub(super) fn next_term_infer_of_kind(&mut self, kind: I::Term) -> I::Term {
-        match kind.kind() {
+    pub(super) fn next_term_infer_of_kind(&mut self, term: I::Term) -> I::Term {
+        match term.kind() {
             ty::TermKind::Ty(_) => self.next_ty_infer().into(),
             ty::TermKind::Const(_) => self.next_const_infer().into(),
         }
@@ -830,6 +938,22 @@ where
                             ControlFlow::Continue(())
                         }
                     }
+                }
+            }
+
+            fn visit_predicate(&mut self, p: I::Predicate) -> Self::Result {
+                if p.has_non_region_infer() || p.has_placeholders() {
+                    p.super_visit_with(self)
+                } else {
+                    ControlFlow::Continue(())
+                }
+            }
+
+            fn visit_clauses(&mut self, c: I::Clauses) -> Self::Result {
+                if c.has_non_region_infer() || c.has_placeholders() {
+                    c.super_visit_with(self)
+                } else {
+                    ControlFlow::Continue(())
                 }
             }
         }
@@ -987,6 +1111,14 @@ where
         self.delegate.resolve_vars_if_possible(value)
     }
 
+    pub(super) fn eager_resolve_region(&self, r: I::Region) -> I::Region {
+        if let ty::ReVar(vid) = r.kind() {
+            self.delegate.opportunistic_resolve_lt_var(vid)
+        } else {
+            r
+        }
+    }
+
     pub(super) fn fresh_args_for_item(&mut self, def_id: I::DefId) -> I::GenericArgs {
         let args = self.delegate.fresh_args_for_item(def_id);
         for arg in args.iter() {
@@ -1000,7 +1132,7 @@ where
     }
 
     pub(super) fn register_region_outlives(&self, a: I::Region, b: I::Region) {
-        // `b : a` ==> `a <= b`
+        // `'a: 'b` ==> `'b <= 'a`
         self.delegate.sub_regions(b, a, self.origin_span);
     }
 
@@ -1065,14 +1197,17 @@ where
         &mut self,
         key: ty::OpaqueTypeKey<I>,
     ) -> Option<(ty::OpaqueTypeKey<I>, I::Ty)> {
-        let mut matching =
-            self.delegate.clone_opaque_types_for_query_response().into_iter().filter(
-                |(candidate_key, _)| {
-                    candidate_key.def_id == key.def_id
-                        && DeepRejectCtxt::relate_rigid_rigid(self.cx())
-                            .args_may_unify(candidate_key.args, key.args)
-                },
-            );
+        // We shouldn't have any duplicate entries when using
+        // this function during `TypingMode::Analysis`.
+        let duplicate_entries = self.delegate.clone_duplicate_opaque_types();
+        assert!(duplicate_entries.is_empty(), "unexpected duplicates: {duplicate_entries:?}");
+        let mut matching = self.delegate.clone_opaque_types_lookup_table().into_iter().filter(
+            |(candidate_key, _)| {
+                candidate_key.def_id == key.def_id
+                    && DeepRejectCtxt::relate_rigid_rigid(self.cx())
+                        .args_may_unify(candidate_key.args, key.args)
+            },
+        );
         let first = matching.next();
         let second = matching.next();
         assert_eq!(second, None);
@@ -1097,6 +1232,14 @@ where
         assume: I::Const,
     ) -> Result<Certainty, NoSolution> {
         self.delegate.is_transmutable(dst, src, assume)
+    }
+
+    pub(super) fn replace_bound_vars<T: TypeFoldable<I>>(
+        &self,
+        t: T,
+        universes: &mut Vec<Option<ty::UniverseIndex>>,
+    ) -> T {
+        BoundVarReplacer::replace_bound_vars(&**self.delegate, universes, t).0
     }
 }
 
